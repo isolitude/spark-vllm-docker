@@ -1,2 +1,4 @@
 .env
 build-metadata.yaml
+myrecipe/
+output.log

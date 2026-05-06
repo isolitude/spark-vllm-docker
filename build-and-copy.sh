@@ -474,6 +474,11 @@ COMMON_BUILD_FLAGS+=("--build-arg" "FLASHINFER_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
 if [ -n "$NETWORK_ARG" ]; then
     COMMON_BUILD_FLAGS+=("--network" "$NETWORK_ARG")
 fi
+PROXY_URL="http://192.168.4.157:7890"
+COMMON_BUILD_FLAGS+=("--build-arg" "HTTP_PROXY=$PROXY_URL")
+COMMON_BUILD_FLAGS+=("--build-arg" "HTTPS_PROXY=$PROXY_URL")
+COMMON_BUILD_FLAGS+=("--build-arg" "http_proxy=$PROXY_URL")
+COMMON_BUILD_FLAGS+=("--build-arg" "https_proxy=$PROXY_URL")
 
 # =====================================================
 # Build image (unless --no-build or --exp-mxfp4)
