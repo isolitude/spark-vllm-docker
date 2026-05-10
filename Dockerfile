@@ -197,6 +197,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         cd vllm && \
         git fetch origin && \
         git fetch origin --tags --force && \
+        case "${VLLM_REF}" in refs/pull/*/head) git fetch origin "${VLLM_REF}:${VLLM_REF}" ;; esac && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
         git submodule update --init --recursive && \
         git clean -fdx && \

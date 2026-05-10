@@ -11,6 +11,7 @@ This mirrors the approach from (closed) PR #38858.
 """
 
 import glob
+import re
 import sys
 
 # Find the chat completion serving module
@@ -66,20 +67,14 @@ if last_import_pos == -1:
     print("ERROR: Could not find import block to inject helper", file=sys.stderr)
     sys.exit(1)
 
-# Find end of that import line
-end_of_line = content.index("\n", last_import_pos)
-# Find end of import block (next blank line or non-import line)
-pos = end_of_line + 1
-while pos < len(content):
-    line_end = content.find("\n", pos)
-    if line_end == -1:
-        line_end = len(content)
-    line = content[pos:line_end].strip()
-    if line and not line.startswith(("from ", "import ", "#", ")")):
-        break
-    pos = line_end + 1
+# Find the first top-level class or def after the last import line,
+# so we inject at module scope rather than inside an expression.
+m = re.search(r'\n(class |def )', content[last_import_pos:])
+if not m:
+    print("ERROR: Could not find a top-level class/def to anchor injection", file=sys.stderr)
+    sys.exit(1)
 
-inject_pos = pos
+inject_pos = last_import_pos + m.start() + 1  # +1 to skip the leading \n
 content = content[:inject_pos] + helper_fn + "\n" + content[inject_pos:]
 
 # Step 2: Replace extract_reasoning calls to use re-decoded text
