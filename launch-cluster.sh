@@ -895,9 +895,9 @@ start_ray_head() {
     local container="$1"
     echo "Starting Ray HEAD node on $HEAD_IP..."
     head_docker_exec_d "$container" bash -c \
-        "\"ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 \
+        "ray start --block --head --port $MASTER_PORT --object-store-memory 1073741824 --num-cpus 2 \
          --node-ip-address $HEAD_IP --include-dashboard=false --disable-usage-stats \
-         >> /proc/1/fd/1 2>&1\""
+         >> /proc/1/fd/1 2>&1"
 }
 
 # Start Ray worker node inside the container on a remote host
