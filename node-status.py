@@ -299,7 +299,7 @@ def mem_bar(used: str, total: str, width: int = 20) -> str:
         return ""
 
 
-def print_node(result: NodeResult, local_hf: set[str], local_imgs: set[str], perf_only: bool = False):
+def print_node(result: NodeResult, local_hf: set[str], local_imgs: dict[str, str], perf_only: bool = False):
     label = result.node
     if result.hostname and result.hostname != result.node:
         label += f" ({result.hostname})"
@@ -406,8 +406,13 @@ def print_node(result: NodeResult, local_hf: set[str], local_imgs: set[str], per
             for full_name in sorted(local_imgs):
                 if full_name in remote_imgs:
                     img = remote_imgs[full_name]
+                    local_id = local_imgs[full_name]
+                    if local_id and img.image_id and local_id != img.image_id:
+                        status = f"{C.YELLOW}↑ sync required{C.RESET}"
+                    else:
+                        status = f"{C.GREEN}✓{C.RESET}"
                     print(f"    {full_name:<42}  {img.image_id:<14}  "
-                          f"{img.size:<10}  {C.DIM}{img.created}{C.RESET}  {C.GREEN}✓{C.RESET}")
+                          f"{img.size:<10}  {C.DIM}{img.created}{C.RESET}  {status}")
                 else:
                     print(f"    {C.RED}{full_name:<42}  {'':14}  {'':10}  ✗ missing{C.RESET}")
                 printed = True
@@ -436,7 +441,7 @@ def print_node(result: NodeResult, local_hf: set[str], local_imgs: set[str], per
 
 
 # ── JSON output ───────────────────────────────────────────────────────────────
-def result_to_dict(result: NodeResult, local_hf: set[str], local_imgs: set[str]) -> dict:
+def result_to_dict(result: NodeResult, local_hf: set[str], local_imgs: dict[str, str]) -> dict:
     return {
         "node": result.node,
         "is_local": result.is_local,
@@ -489,15 +494,23 @@ def get_local_hf_models(hf_cache_dir: str) -> set[str]:
     return models
 
 
-def get_local_docker_images() -> set[str]:
+def get_local_docker_images() -> dict[str, str]:
+    """Returns {full_name: image_id} for all local docker images."""
     try:
         proc = subprocess.run(
-            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}"],
             capture_output=True, text=True, timeout=10,
         )
-        return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+        result = {}
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            result[parts[0]] = parts[1] if len(parts) == 2 else ""
+        return result
     except Exception:
-        return set()
+        return {}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
