@@ -69,6 +69,7 @@ RECIPE YAML SCHEMA:
     build_args: list[str]  # Optional: Args for build-and-copy.sh
     cluster_only: bool     # Optional: Require cluster mode (default: false)
     solo_only: bool        # Optional: Require solo mode (default: false)
+    container_name: str    # Optional: Docker container name (default: vllm_node)
 
 RECIPE VERSION HISTORY:
     Version 1 (default): Initial schema with all fields above supported.
@@ -183,6 +184,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
     recipe.setdefault("env", {})
     recipe.setdefault("cluster_only", False)
     recipe.setdefault("solo_only", False)
+    recipe.setdefault("container_name", None)
 
     # Validate recipe version compatibility
     # EXTENSIBILITY: When adding new schema versions, update SUPPORTED_VERSIONS
@@ -563,7 +565,7 @@ def load_env_file() -> dict[str, str]:
         Dictionary of key=value pairs from .env file
     """
     env = {}
-    if ENV_FILE.exists():
+    if ENV_FILE and ENV_FILE.exists():
         with open(ENV_FILE) as f:
             for line in f:
                 line = line.strip()
@@ -1219,8 +1221,9 @@ Examples:
             cmd_parts.extend(["-e", env_var])
         if args.master_port:
             cmd_parts.extend(["--master-port", str(args.master_port)])
-        if args.container_name:
-            cmd_parts.extend(["--name", args.container_name])
+        effective_container_name = args.container_name or recipe.get("container_name")
+        if effective_container_name:
+            cmd_parts.extend(["--name", effective_container_name])
         if eth_if:
             cmd_parts.extend(["--eth-if", eth_if])
         if ib_if:
@@ -1290,8 +1293,9 @@ Examples:
 
         if args.master_port:
             cmd.extend(["--master-port", str(args.master_port)])
-        if args.container_name:
-            cmd.extend(["--name", args.container_name])
+        effective_container_name = args.container_name or recipe.get("container_name")
+        if effective_container_name:
+            cmd.extend(["--name", effective_container_name])
         if eth_if:
             cmd.extend(["--eth-if", eth_if])
         if ib_if:
