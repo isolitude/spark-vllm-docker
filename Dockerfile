@@ -3,12 +3,16 @@
 # Limit build parallelism to reduce OOM situations
 ARG BUILD_JOBS=16
 
+# Proxy settings (pass via --build-arg if needed)
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+
 # =========================================================
 # STAGE 1: Base Build Image
 # =========================================================
 FROM nvidia/cuda:13.2.0-devel-ubuntu24.04 AS base
 
-# Build parallemism
+# Build parallelism
 ARG BUILD_JOBS
 ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
@@ -16,6 +20,14 @@ ENV NINJAFLAGS="-j${BUILD_JOBS}"
 ENV MAKEFLAGS="-j${BUILD_JOBS}"
 ENV DG_JIT_USE_NVRTC=1
 ENV USE_CUDNN=1
+
+# Proxy (pass via --build-arg HTTP_PROXY=... HTTPS_PROXY=...)
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV http_proxy=${HTTP_PROXY}
+ENV https_proxy=${HTTPS_PROXY}
+ENV HTTP_PROXY=${HTTP_PROXY}
+ENV HTTPS_PROXY=${HTTPS_PROXY}
 
 # Set non-interactive frontend to prevent apt prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -47,6 +59,22 @@ RUN apt update && \
     ccache devscripts debhelper fakeroot \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
+
+# Write proxy into git global config so cmake FetchContent git clones also use it
+ARG HTTP_PROXY
+RUN if [ -n "$HTTP_PROXY" ]; then \
+        git config --global http.proxy "$HTTP_PROXY" && \
+        git config --global https.proxy "$HTTP_PROXY"; \
+    fi
+
+# Also write to /etc/gitconfig (system-level) so cmake subprocess git calls pick it up
+# regardless of HOME or GIT_CONFIG_GLOBAL environment
+RUN if [ -n "$HTTP_PROXY" ]; then \
+        git config --system http.proxy "$HTTP_PROXY" && \
+        git config --system https.proxy "$HTTP_PROXY"; \
+    fi
+
+ENV GIT_CONFIG_GLOBAL=/etc/gitconfig
 
 # Additional deps
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
