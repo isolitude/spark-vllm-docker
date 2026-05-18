@@ -6,13 +6,14 @@ name: DeepSeek-V4-Flash
 description: DeepSeek V4 Flash FP8 on dual DGX Spark TP=2 with PR 41834 SM12x support
 model: deepseek-ai/DeepSeek-V4-Flash
 container: vllm-node-dsv4
+container_name: vllm_deepseek_v4_flash
 cluster_only: true
 
 build_args:
   - --vllm-repo
   - https://github.com/jasl/vllm.git
   - --vllm-ref
-  - ds4-sm120
+  - ds4-sm120-preview-dev
   - --rebuild-vllm
 
 mods: []
@@ -27,7 +28,7 @@ defaults:
   max_num_batched_tokens: 4192
   max_num_seqs: 20
   block_size: 256
-  served_model_name: deepseek-v4-flash
+  api_key: "asdfkjhiluwetypooidfvhiuasdg3253tsdf87q39rdsfaf98"
 
 env:
   TORCH_CUDA_ARCH_LIST: 12.1a
@@ -43,7 +44,6 @@ env:
 
 command: |
   vllm serve deepseek-ai/DeepSeek-V4-Flash \
-    --served-model-name {served_model_name} \
     --host {host} \
     --port {port} \
     --trust-remote-code \
@@ -57,12 +57,13 @@ command: |
     --max-num-batched-tokens {max_num_batched_tokens} \
     --gpu-memory-utilization {gpu_memory_utilization} \
     --distributed-executor-backend mp \
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+    --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":2}}' \
     --tokenizer-mode deepseek_v4 \
     --tool-call-parser deepseek_v4 \
     --enable-auto-tool-choice \
     --reasoning-parser deepseek_v4 \
-    --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}' \
-    --default-chat-template-kwargs '{"thinking":true}' \
-    --load-format safetensors
+    --reasoning-config '{{"reasoning_parser":"deepseek_v4","reasoning_start_str":"<think>","reasoning_end_str":"</think>"}}' \
+    --default-chat-template-kwargs '{{"thinking":true}}' \
+    --load-format safetensors \
+    --api-key {api_key}
