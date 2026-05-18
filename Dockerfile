@@ -77,6 +77,13 @@ RUN git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git && \
     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
 
+# Pin runtime NCCL to the version used by the current SM12x validation.
+RUN apt update && \
+    apt install -y --no-install-recommends --allow-downgrades \
+    libnccl2=2.30.4-1+cuda13.2 \
+    libnccl-dev=2.30.4-1+cuda13.2 && \
+    rm -rf /var/lib/apt/lists/*
+
 # =========================================================
 # STAGE 2: FlashInfer Builder
 # =========================================================
@@ -181,13 +188,14 @@ ARG CACHEBUST_VLLM=1
 
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
+        git clone --recursive ${VLLM_REPO} vllm; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
             git checkout ${VLLM_REF}; \
@@ -195,6 +203,9 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     else \
         echo "Cache hit: Fetching updates..." && \
         cd vllm && \
+        (git cherry-pick --abort >/dev/null 2>&1 || true) && \
+        git reset --hard && \
+        git remote set-url origin ${VLLM_REPO} && \
         git fetch origin && \
         git fetch origin --tags --force && \
         case "${VLLM_REF}" in refs/pull/*/head) git fetch origin "${VLLM_REF}:${VLLM_REF}" ;; esac && \
@@ -322,6 +333,9 @@ RUN --mount=type=bind,from=base,source=/workspace/vllm/nccl/build/pkg/deb,target
     libibverbs1 libibverbs-dev rdma-core \
     libxcb1 \
     && cd /workspace/nccl-pkg && apt install -y --no-install-recommends --allow-downgrades ./*.deb \
+    && apt install -y --no-install-recommends --allow-downgrades \
+        libnccl2=2.30.4-1+cuda13.2 \
+        libnccl-dev=2.30.4-1+cuda13.2 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install uv
 
