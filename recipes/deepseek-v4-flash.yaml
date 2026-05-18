@@ -12,7 +12,7 @@ build_args:
   - --vllm-repo
   - https://github.com/jasl/vllm.git
   - --vllm-ref
-  - b1c97ff068b23858a4759394f8d6c858d822c957
+  - ds4-sm120
   - --rebuild-vllm
 
 mods: []
