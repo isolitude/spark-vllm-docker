@@ -206,7 +206,7 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
         (git cherry-pick --abort >/dev/null 2>&1 || true) && \
         git reset --hard && \
         git remote set-url origin ${VLLM_REPO} && \
-        git fetch origin && \
+        git fetch --all && \
         git fetch origin --tags --force && \
         case "${VLLM_REF}" in refs/pull/*/head) git fetch origin "${VLLM_REF}:${VLLM_REF}" ;; esac && \
         (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
