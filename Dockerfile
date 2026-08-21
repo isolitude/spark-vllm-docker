@@ -765,9 +765,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv pip install ray[default] fastsafetensors instanttensor \
         --override /tmp/torch-override.txt
 
-# The local-inference-lab vLLM fork consumes the external B12X kernel package
-# at runtime. Keep this opt-in so ordinary vLLM images do not pull a
-# package that requires Torch 2.12+. Build B12X from its source repository but
+# Upstream vLLM and the local-inference-lab fork consume the external B12X
+# kernel package at runtime. Build B12X from its source repository but
 # install it without dependencies: vLLM already provides the runtime packages
 # and this image deliberately advances nvidia-cutlass-dsl to 4.7.0 for both
 # regular and B12X builds. B12X kernels remain JIT-compiled on first use;

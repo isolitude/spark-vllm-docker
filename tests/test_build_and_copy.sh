@@ -319,6 +319,15 @@ test_use_wheels_uses_wheel_build() {
     pass "--use-wheels builds only the runner from precompiled wheels"
 }
 
+test_regular_build_includes_b12x_package() {
+    setup_fixture
+    run_build --use-wheels || fail "regular B12X package run failed"
+    assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/regular .*--build-arg B12X_REPO=https://github.com/lukealonso/b12x.git --build-arg B12X_REF=master '
+    assert_log_contains '.*--build-arg B12X_CACHEBUST=[0-9]+'
+    assert_output_contains 'Building B12X from https://github\.com/lukealonso/b12x\.git ref master for https://github\.com/vllm-project/vllm ref main\.'
+    pass "regular upstream vLLM builds include the B12X package"
+}
+
 test_use_wheels_never_falls_back_to_source() {
     setup_fixture
     rm -f "$FIXTURE_DIR/.wheel-cache/flashinfer/regular"/*.whl \
@@ -585,20 +594,20 @@ test_exp_b12x_rejects_preset_overrides() {
     pass "--exp-b12x rejects conflicting build presets and overrides"
 }
 
-test_exp_b12x_variable_names_are_generic() {
+test_b12x_package_variable_names_are_generic() {
     if grep -q 'FATHOMLESS_' "$PROJECT_DIR/build-and-copy.sh"; then
         fail "build-and-copy.sh still contains FATHOMLESS-prefixed variables"
     fi
     for expected in \
         'EXP_B12X_VLLM_REPO=' \
         'EXP_B12X_VLLM_REF=' \
-        'EXP_B12X_PACKAGE_REPO=' \
-        'EXP_B12X_PACKAGE_REF='; do
+        'B12X_PACKAGE_REPO=' \
+        'B12X_PACKAGE_REF='; do
         if ! grep -Fq "$expected" "$PROJECT_DIR/build-and-copy.sh"; then
             fail "build-and-copy.sh is missing generic B12X variable: $expected"
         fi
     done
-    pass "B12X preset variables use generic EXP_B12X names"
+    pass "B12X package variables use generic names"
 }
 
 test_exp_b12x_preserves_blackwell_arches() {
@@ -1038,6 +1047,7 @@ test_use_wheels_rejects_mismatched_flashinfer_arch
 test_use_wheels_rejects_mismatched_vllm_arch
 test_use_wheels_non_default_empty_cache_skips_downloads
 test_use_wheels_uses_wheel_build
+test_regular_build_includes_b12x_package
 test_use_wheels_never_falls_back_to_source
 test_use_wheels_never_builds_missing_vllm_implicitly
 test_use_wheels_builds_only_explicit_source_target
@@ -1064,7 +1074,7 @@ test_exp_b12x_allows_vllm_prs
 test_exp_b12x_respects_custom_tag
 test_exp_b12x_rejects_use_wheels
 test_exp_b12x_rejects_preset_overrides
-test_exp_b12x_variable_names_are_generic
+test_b12x_package_variable_names_are_generic
 test_exp_b12x_preserves_blackwell_arches
 test_exp_b12x_rebuilds_mismatched_cached_flashinfer_arch
 test_exp_b12x_rebuilds_mismatched_cached_vllm_arch

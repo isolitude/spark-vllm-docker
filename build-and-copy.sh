@@ -30,8 +30,8 @@ VLLM_REF_SET=false
 EXP_B12X=false
 EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
 EXP_B12X_VLLM_REF="dev/infernal-invocation"
-EXP_B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
-EXP_B12X_PACKAGE_REF="master"
+B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
+B12X_PACKAGE_REF="master"
 EXP_B12X_TORCH_VERSION="2.13.0"
 EXP_B12X_TORCHVISION_VERSION="0.28.0"
 EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
@@ -714,13 +714,16 @@ fi
 
 NORMALIZED_VLLM_REPO="${VLLM_REPO%/}"
 NORMALIZED_VLLM_REPO="${NORMALIZED_VLLM_REPO%.git}"
-if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
-    B12X_REPO="$EXP_B12X_PACKAGE_REPO"
-    B12X_REF="$EXP_B12X_PACKAGE_REF"
+NORMALIZED_DEFAULT_VLLM_REPO="${DEFAULT_VLLM_REPO%/}"
+NORMALIZED_DEFAULT_VLLM_REPO="${NORMALIZED_DEFAULT_VLLM_REPO%.git}"
+if [ "$NORMALIZED_VLLM_REPO" = "$NORMALIZED_DEFAULT_VLLM_REPO" ] || \
+   [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
+    B12X_REPO="$B12X_PACKAGE_REPO"
+    B12X_REF="$B12X_PACKAGE_REF"
     B12X_CACHEBUST="$(date +%s)"
     TORCH_BASE_VERSION="${TORCH_VERSION%%+*}"
     if [ "$(printf '%s\n' "2.12.0" "$TORCH_BASE_VERSION" | sort -V | head -n1)" != "2.12.0" ]; then
-        echo "Error: ${EXP_B12X_VLLM_REPO} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
+        echo "Error: ${NORMALIZED_VLLM_REPO} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
         exit 1
     fi
     echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."

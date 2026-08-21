@@ -89,7 +89,7 @@ The default image preparation speed depends mostly on your Internet connection a
 
 For slower internet connections it can be faster to build from the precompiled wheels by using `--use-wheels` parameter. An initial build speed depends on your Internet connection speed and whether the base image is already present on your machine. After base image pull, the build should take only 2-3 minutes.
 
-If `--use-wheels`, `--rebuild-vllm`, `--rebuild-flashinfer`, or another build customization is used, the script keeps the local wheel-based runner path. `--use-wheels` by itself only downloads or reuses precompiled wheels; source compilation occurs only for a dependency explicitly selected by a source-build flag. Full source rebuilds can take 20-40 minutes, but subsequent builds are faster.
+If `--use-wheels`, `--rebuild-vllm`, `--rebuild-flashinfer`, or another build customization is used, the script keeps the local wheel-based runner path. `--use-wheels` by itself only downloads or reuses precompiled vLLM and FlashInfer wheels; the runner stage still installs its normal runtime dependencies, including the B12X package for regular upstream builds. Source compilation of vLLM or FlashInfer occurs only when that dependency is explicitly selected by a source-build flag. Full source rebuilds can take 20-40 minutes, but subsequent builds are faster.
 
 ### Run
 
@@ -167,6 +167,15 @@ Don't do it every time you rebuild, because it will slow down compilation times.
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
 
 ## CHANGELOG
+
+### 2026-08-21
+
+#### B12X package in regular builds
+
+Regular local runner builds from `vllm-project/vllm` now build and install the
+external B12X package, matching the B12X support being integrated into upstream
+vLLM. The experimental `--exp-b12x` profile continues to install the same
+package for its maintained fork.
 
 ### 2026-08-19
 
@@ -1503,7 +1512,7 @@ Only regular vLLM wheels are downloaded from the published wheel release.
 `--exp-b12x` is therefore incompatible with `--use-wheels`: use bare
 `--exp-b12x` for the published image or add `--rebuild-vllm` for a source build.
 
-For any branch, tag, or commit selected from `local-inference-lab/vllm`, the runner freshly clones the `master` ref of `https://github.com/lukealonso/b12x.git`, builds and installs its `b12x` distribution automatically. A per-build cache key prevents Docker from reusing a stale source checkout. Before the `--no-deps` install, its package metadata is updated to the image-wide CUTLASS DSL 4.7.0 pin. The exact source commit is recorded at `/workspace/b12x-source-commit`. B12X requires PyTorch 2.12 or newer; the preset uses 2.13.0.
+For regular `vllm-project/vllm` builds and any branch, tag, or commit selected from `local-inference-lab/vllm`, the runner freshly clones the `master` ref of `https://github.com/lukealonso/b12x.git`, builds and installs its `b12x` distribution automatically. A per-build cache key prevents Docker from reusing a stale source checkout. Before the `--no-deps` install, its package metadata is updated to the image-wide CUTLASS DSL 4.7.0 pin. The exact source commit is recorded at `/workspace/b12x-source-commit`. B12X requires PyTorch 2.12 or newer; both current build profiles use 2.13.0.
 
 **Copy existing image without rebuilding:**
 
