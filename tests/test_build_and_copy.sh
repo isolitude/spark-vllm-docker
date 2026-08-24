@@ -717,6 +717,79 @@ PY
     pass "B12X C128A alignment workaround is guarded and idempotent"
 }
 
+test_mrv2_speculator_cudagraph_pool_patch_is_guarded_and_idempotent() {
+    local patch_script="$PROJECT_DIR/docker/patch_vllm_mrv2_speculator_cudagraph_pool.py"
+    local patch_fixture="$TMP_BASE/mrv2-speculator-cudagraph-pool"
+    local target_dir="$patch_fixture/vllm/v1/worker/gpu"
+    local target="$target_dir/cudagraph_utils.py"
+    local output="$patch_fixture/output.log"
+    local unknown_fixture="$TMP_BASE/mrv2-speculator-cudagraph-pool-unknown"
+
+    mkdir -p "$target_dir"
+    cat > "$target" <<'PY'
+from typing import Any
+
+
+class CudaGraphManager:
+    pass
+
+
+def profile_cudagraph_memory(runner):
+    """PIECEWISE, encoder and speculator graphs are measured in full."""
+    manager = runner.cudagraph_manager
+    all_wrappers: list[Any] = []
+    original_pools: dict[int, Any] = {}
+    try:
+        manager.pool = current_platform.graph_pool_handle()
+        if manager.use_breakable_cg:
+            pass
+    finally:
+        CUDAGraphWrapper.clear_all_graphs()
+        BreakableCUDAGraphWrapper.clear_all_graphs()
+        for wrapper in all_wrappers:
+            pass
+PY
+    cp -a "$patch_fixture" "$unknown_fixture"
+    sed -i 's/if manager.use_breakable_cg:/if bool(manager.use_breakable_cg):/' \
+        "$unknown_fixture/vllm/v1/worker/gpu/cudagraph_utils.py"
+
+    python3 "$patch_script" "$patch_fixture" > "$output"
+    for expected in \
+        'speculator_manager.pool = manager.pool' \
+        'speculator_manager.graphs.clear()' \
+        'setattr(runner.speculator, name, None)'; do
+        if ! grep -Fq "$expected" "$target"; then
+            fail "MRV2 speculator pool patch is missing: $expected"
+        fi
+    done
+    python3 -m py_compile "$target"
+
+    local before after
+    before=$(sha256sum "$target")
+    python3 "$patch_script" "$patch_fixture" >> "$output"
+    after=$(sha256sum "$target")
+    if [ "$before" != "$after" ]; then
+        fail "MRV2 speculator pool patch is not idempotent"
+    fi
+    if ! grep -Fq \
+        'Equivalent MRV2 speculator CUDA-graph pool fix is present; skipping' \
+        "$output"; then
+        fail "MRV2 speculator pool patch did not report its idempotent skip"
+    fi
+
+    local unknown_target="$unknown_fixture/vllm/v1/worker/gpu/cudagraph_utils.py"
+    local unknown_before unknown_after
+    unknown_before=$(sha256sum "$unknown_target")
+    if python3 "$patch_script" "$unknown_fixture" >> "$output" 2>&1; then
+        fail "MRV2 speculator pool patch accepted an unknown vulnerable layout"
+    fi
+    unknown_after=$(sha256sum "$unknown_target")
+    if [ "$unknown_before" != "$unknown_after" ]; then
+        fail "MRV2 speculator pool patch partially modified an unknown layout"
+    fi
+    pass "MRV2 speculator CUDA-graph pool workaround is guarded and idempotent"
+}
+
 test_dockerfile_preserves_selected_blackwell_target() {
     local blackwell_block="$TMP_BASE/blackwell-block"
     local patch_fixture="$TMP_BASE/blackwell-patch"
@@ -1020,8 +1093,8 @@ test_dockerfile_externalizes_vllm_source_patches() {
             fail "Dockerfile does not execute external patch: $patch_name"
         fi
     done
-    if [ "$patch_count" -ne 11 ]; then
-        fail "Expected 11 external vLLM patch scripts, found $patch_count"
+    if [ "$patch_count" -ne 12 ]; then
+        fail "Expected 12 external vLLM patch scripts, found $patch_count"
     fi
     if ! python3 -c '
 from pathlib import Path
@@ -1079,6 +1152,7 @@ test_exp_b12x_preserves_blackwell_arches
 test_exp_b12x_rebuilds_mismatched_cached_flashinfer_arch
 test_exp_b12x_rebuilds_mismatched_cached_vllm_arch
 test_b12x_c128a_alignment_patch_is_guarded_and_idempotent
+test_mrv2_speculator_cudagraph_pool_patch_is_guarded_and_idempotent
 test_dockerfile_preserves_selected_blackwell_target
 test_custom_torch_versions_are_forwarded
 test_local_inference_lab_b12x_applies_to_any_ref

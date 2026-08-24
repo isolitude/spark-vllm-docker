@@ -501,6 +501,15 @@ RUN set -eux; \
 # the fix (idempotent); unknown partial source shapes fail the build.
 COPY docker/patch_vllm_*.py docker/pin_cutlass_dsl.py /tmp/vllm-patches/
 
+# TEMPORARY PATCH: vLLM PR #53306 added a preliminary CUDA-graph memory
+# profiling capture, but only redirects the main graph manager and existing
+# wrappers to its throwaway pool. MTP and other autoregressive speculators own
+# separate prefill/decode managers, so their discarded profiling graphs can
+# invalidate the persistent global pool before the real FULL capture. Keep all
+# speculator managers in the throwaway pool until the oldest supported ref has
+# the equivalent upstream fix.
+RUN python3 /tmp/vllm-patches/patch_vllm_mrv2_speculator_cudagraph_pool.py .
+
 # TEMPORARY PATCH: local-inference-lab/vllm commit ad848fc41 added a dynamic
 # DeepSeek V4 C128A top-k width but omitted the alignment constant import.
 # Keep this B12X-only and source-aware so it skips refs where the bug is absent
