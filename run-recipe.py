@@ -11,8 +11,8 @@ pre-configured settings. It handles:
 - Both solo (single node) and cluster deployments
 
 Usage:
-    ./run-recipe.py recipes/glm-4.7-nvfp4.yaml
-    ./run-recipe.py glm-4.7-nvfp4 --port 9000 --solo
+    ./run-recipe.py recipes/deepseek-v4-flash-0731.yaml
+    ./run-recipe.py glm-4.7-flash-awq --port 9000 --solo
     ./run-recipe.py minimax-m2-awq --setup  # Full setup: build + download + run
     ./run-recipe.py --list
 
@@ -86,6 +86,7 @@ RELATED FILES:
 
 import argparse
 import os
+import re
 import subprocess
 import shlex
 import sys
@@ -107,6 +108,53 @@ BUILD_SCRIPT = SCRIPT_DIR / "build-and-copy.sh"
 DOWNLOAD_SCRIPT = SCRIPT_DIR / "hf-download.sh"
 AUTODISCOVER_SCRIPT = SCRIPT_DIR / "autodiscover.sh"
 ENV_FILE = None  # Will be set from CLI argument or default
+DISTRIBUTED_EXECUTOR_RE = re.compile(
+    r"--distributed-executor-backend(?:=|\s+)\S+"
+)
+
+
+def runtime_vllm_pr_number(value: str) -> str:
+    """Validate an upstream vLLM PR number without accepting URL fragments."""
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise argparse.ArgumentTypeError("must be a positive integer PR number")
+    return value
+
+
+class OrderedLaunchLayerAction(argparse.Action):
+    """Collect a repeatable launch layer while preserving mixed CLI ordering."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str,
+        option_string: str | None = None,
+    ) -> None:
+        collected = list(getattr(namespace, self.dest, None) or [])
+        collected.append(values)
+        setattr(namespace, self.dest, collected)
+
+        ordered = list(getattr(namespace, "launch_layers", None) or [])
+        ordered.append((self.dest, values))
+        setattr(namespace, "launch_layers", ordered)
+
+
+def strip_distributed_executor_backend(command: str) -> str:
+    """Remove vLLM distributed executor backend flags from a command."""
+    command = DISTRIBUTED_EXECUTOR_RE.sub("", command)
+    lines = command.split("\n")
+    filtered_lines = [line for line in lines if line.strip() not in ("", "\\")]
+    return "\n".join(filtered_lines)
+
+
+def ensure_ray_backend(command: str) -> str:
+    """Append the Ray executor backend for vLLM serve commands that omit it."""
+    if "vllm serve" not in command:
+        return command
+    if DISTRIBUTED_EXECUTOR_RE.search(command):
+        return command
+    return command.rstrip() + " --distributed-executor-backend ray"
+
 
 
 def load_recipe(recipe_path: Path) -> dict[str, Any]:
@@ -413,7 +461,7 @@ def generate_launch_script(
     overrides: dict[str, Any],
     is_solo: bool = False,
     extra_args: list[str] | None = None,
-    no_ray: bool = False,
+    use_ray: bool = False,
 ) -> str:
     """
     Generate a bash launch script from the recipe.
@@ -435,9 +483,13 @@ def generate_launch_script(
         max_model_len: Maximum sequence length
         (custom variables can be added via recipe defaults)
 
-    SOLO MODE BEHAVIOR:
-        - Removes '--distributed-executor-backend ray' lines
+    SOLO BEHAVIOR:
+        - Strips distributed executor configuration
         - Typically sets tensor_parallel=1 (handled by caller)
+
+    MULTI-NODE BACKEND BEHAVIOR:
+        - No-Ray is the default
+        - --ray preserves or adds Ray distributed executor configuration
 
     EXTRA ARGS:
         - Appended verbatim to the end of the vLLM command
@@ -447,8 +499,9 @@ def generate_launch_script(
     Args:
         recipe: Loaded recipe dictionary
         overrides: CLI-provided parameter overrides (take precedence over defaults)
-        is_solo: If True, strip distributed executor configuration
+        is_solo: If True, generate a single-node launch script
         extra_args: Additional arguments to append to vLLM command (after --)
+        use_ray: If True, preserve/add Ray distributed executor configuration
 
     Returns:
         Complete bash script content as string
@@ -479,19 +532,7 @@ def generate_launch_script(
         print(f"Available parameters: {list(params.keys())}")
         sys.exit(1)
 
-    # In solo or no-ray mode, remove --distributed-executor-backend
-    # (not needed for solo; no-ray uses PyTorch distributed instead)
-    if is_solo or no_ray:
-        import re
-
-        # Remove just the flag and its value, not the whole line
-        command = re.sub(r"--distributed-executor-backend\s+\S+", "", command)
-        # Remove lines that are now empty or just a backslash continuation
-        lines_list = command.split("\n")
-        filtered_lines = [line for line in lines_list if line.strip() not in ("", "\\")]
-        command = "\n".join(filtered_lines)
-
-    # Remove trailing backslash if present
+    # Remove trailing backslash if present before appending extra args.
     command = command.rstrip()
     if command.endswith("\\"):
         command = command.rstrip("\\\n").rstrip()
@@ -501,6 +542,12 @@ def generate_launch_script(
         # Join extra args and append to command
         extra_args_str = " ".join(shlex.quote(a) for a in extra_args)
         command = command + " " + extra_args_str
+
+    # Normalize distributed backend after CLI passthrough. No-Ray is default.
+    if is_solo or not use_ray:
+        command = strip_distributed_executor_backend(command)
+    else:
+        command = ensure_ray_backend(command)
 
     lines.append("# Run the model")
     lines.append(command.strip())
@@ -655,26 +702,38 @@ def main():
         epilog="""
 Examples:
   # Basic usage
-  %(prog)s glm-4.7-nvfp4
-  %(prog)s glm-4.7-nvfp4 --port 9000 --solo
+  %(prog)s glm-4.7-flash-awq --solo
+  %(prog)s glm-4.7-flash-awq --port 9000 --solo
 
   # Full setup (build container + download model + run)
-  %(prog)s glm-4.7-nvfp4 --setup
+  %(prog)s glm-4.7-flash-awq --solo --setup
 
-  # Cluster deployment (manual)
-  %(prog)s glm-4.7-nvfp4 -n 192.168.1.1,192.168.1.2 --setup
-
-  # Cluster deployment (auto-discover)
+  # Cluster deployment (default: auto-discover once, then reuse .env)
   %(prog)s --discover              # Detect nodes and save to .env
-  %(prog)s glm-4.7-nvfp4 --setup   # Uses nodes from .env
+  %(prog)s minimax-m2-awq --setup  # Uses nodes from .env
+
+  # Manual fallback only when autodiscovery cannot support the topology
+  %(prog)s minimax-m2-awq -n HEAD_IP,WORKER_IP --setup
 
   # Just build/download without running
-  %(prog)s glm-4.7-nvfp4 --build-only
-  %(prog)s glm-4.7-nvfp4 --download-only
+  %(prog)s glm-4.7-flash-awq --solo --build-only
+  %(prog)s glm-4.7-flash-awq --solo --download-only
 
   # Pass extra arguments to vLLM (after --)
-  %(prog)s glm-4.7-nvfp4 --solo -- --load-format safetensors
-  %(prog)s glm-4.7-nvfp4 --solo -- --served-model-name my-api
+  %(prog)s glm-4.7-flash-awq --solo -- --load-format safetensors
+  %(prog)s glm-4.7-flash-awq --solo -- --served-model-name my-api
+
+  # Apply additional launch-cluster mods
+  %(prog)s glm-4.7-flash-awq --solo --apply-mod mods/use-official-vllm
+
+  # Apply an upstream vLLM PR at container launch time
+  %(prog)s glm-4.7-flash-awq --solo --apply-vllm-pr 12345
+
+  # Publish ports in solo mode
+  %(prog)s glm-4.7-flash-awq --solo -p 8000:8000
+
+  # Map host directories into the container
+  %(prog)s glm-4.7-flash-awq --solo -v /local/models:/models -v /local/output:/output
 
   # List available recipes
   %(prog)s --list
@@ -758,7 +817,9 @@ Examples:
         "--solo", action="store_true", help="Run in solo mode (single node, no Ray)"
     )
     launch_group.add_argument(
-        "-n", "--nodes", help="Comma-separated list of node IPs (first is head node)"
+        "-n",
+        "--nodes",
+        help="Manual fallback/override: comma-separated node IPs (first is head node)",
     )
     launch_group.add_argument(
         "-d", "--daemon", action="store_true", help="Run in daemon mode"
@@ -784,10 +845,52 @@ Examples:
         help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.",
     )
     launch_group.add_argument(
+        "--apply-mod",
+        action=OrderedLaunchLayerAction,
+        dest="apply_mods",
+        default=[],
+        metavar="PATH",
+        help="Mod directory or zip to pass to launch-cluster.sh. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "--apply-vllm-pr",
+        action=OrderedLaunchLayerAction,
+        type=runtime_vllm_pr_number,
+        dest="apply_vllm_prs",
+        default=[],
+        metavar="PR",
+        help="Apply an upstream vLLM PR to the installed runtime package. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "-p",
+        "--publish",
+        action="append",
+        dest="port_mappings",
+        default=[],
+        metavar="HOST:CONTAINER",
+        help="Publish a container port in solo mode, e.g. -p 8000:8000. Can be used multiple times.",
+    )
+    launch_group.add_argument(
+        "-v",
+        "--volume",
+        action="append",
+        dest="volume_mappings",
+        default=[],
+        metavar="LOCAL:CONTAINER",
+        help="Map a volume using Docker syntax, e.g. -v /local/path:/container/path. Can be used multiple times.",
+    )
+    backend_group = launch_group.add_mutually_exclusive_group()
+    backend_group.add_argument(
+        "--ray",
+        action="store_true",
+        dest="ray",
+        help="Use Ray for multi-node vLLM and ensure --distributed-executor-backend ray is present",
+    )
+    backend_group.add_argument(
         "--no-ray",
         action="store_true",
         dest="no_ray",
-        help="No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend)",
+        help="Default for multi-node vLLM without Ray (accepted for compatibility)",
     )
     launch_group.add_argument(
         "--master-port",
@@ -823,6 +926,24 @@ Examples:
         action="store_true",
         dest="no_cache_dirs",
         help="Do not mount ~/.cache/vllm, ~/.cache/flashinfer, ~/.triton",
+    )
+    launch_group.add_argument(
+        "--keep-entrypoint",
+        action="store_true",
+        dest="keep_entrypoint",
+        help="Keep the Docker image entrypoint instead of clearing it before launch",
+    )
+    launch_group.add_argument(
+        "--earlyoom",
+        action="store_true",
+        dest="earlyoom",
+        help="Run earlyoom as the container foreground process instead of sleep infinity",
+    )
+    launch_group.add_argument(
+        "--earlyoom-args",
+        dest="earlyoom_args",
+        metavar="ARGS",
+        help="Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')",
     )
     launch_group.add_argument(
         "--non-privileged",
@@ -934,6 +1055,10 @@ Examples:
         print(f"  {recipe['description']}")
     print()
 
+    cli_mods = args.apply_mods or []
+    cli_vllm_prs = args.apply_vllm_prs or []
+    cli_launch_layers = getattr(args, "launch_layers", []) or []
+
     # Determine container image
     container = args.container_override or recipe["container"]
     model = recipe.get("model")
@@ -983,22 +1108,30 @@ Examples:
     solo_only = recipe.get("solo_only", False)
     is_solo = args.solo or not is_cluster
 
-    if getattr(args, "no_ray", False) and is_solo:
-        print(
-            "Error: --no-ray is incompatible with --solo. Solo mode already runs without Ray."
-        )
-        return 1
+    use_ray = getattr(args, "ray", False) and not is_solo
+
+    if is_solo:
+        explicit_backend_flag = None
+        if getattr(args, "ray", False):
+            explicit_backend_flag = "--ray"
+        elif getattr(args, "no_ray", False):
+            explicit_backend_flag = "--no-ray"
+        if explicit_backend_flag:
+            print(
+                f"Error: {explicit_backend_flag} is incompatible with --solo or a single-node configuration."
+            )
+            return 1
 
     if cluster_only and is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires cluster mode.")
         print(f"This model is too large to run on a single node.")
         print()
         print("Options:")
-        print(
-            f"  1. Specify nodes directly:  {sys.argv[0]} {args.recipe} -n node1,node2"
-        )
-        print(f"  2. Auto-discover and save:  {sys.argv[0]} --discover")
+        print(f"  1. Auto-discover and save:  {sys.argv[0]} --discover")
         print(f"     Then run:                {sys.argv[0]} {args.recipe}")
+        print(
+            "  2. If autodiscovery cannot support the topology, specify nodes as instructed."
+        )
         return 1
     if solo_only and not is_solo:
         print(f"Error: Recipe '{recipe['name']}' requires solo mode.")
@@ -1007,6 +1140,18 @@ Examples:
         print("Options:")
         print(f"  1. Run solo:                {sys.argv[0]} {args.recipe} --solo")
         print(f"  2. Remove nodes from .env:  {sys.argv[0]} --show-env")
+        return 1
+
+    if args.port_mappings and not is_solo:
+        print(
+            "Error: -p/--publish port forwarding is only supported in solo mode."
+        )
+        print("Use --solo or remove port mappings for cluster mode.")
+        return 1
+
+    if (args.earlyoom or args.earlyoom_args) and args.keep_entrypoint:
+        print("Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint.")
+        print("Remove --keep-entrypoint so earlyoom can run as the foreground process.")
         return 1
 
     # Determine copy targets for build/model distribution.
@@ -1039,6 +1184,8 @@ Examples:
             if worker_nodes:
                 print(f"  Workers: {', '.join(worker_nodes)}")
         print(f"Solo mode: {is_solo}")
+        if is_cluster:
+            print(f"Ray mode: {use_ray}")
         if eth_if:
             print(
                 f"Ethernet interface: {eth_if}{' (from .env)' if not args.eth_if else ''}"
@@ -1051,6 +1198,8 @@ Examples:
             print(f"Container name: {args.container_name}")
         if args.non_privileged:
             print("Non-privileged mode: Yes")
+        if cli_vllm_prs:
+            print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         print()
 
     # --- Build Phase ---
@@ -1191,7 +1340,7 @@ Examples:
         overrides,
         is_solo=is_solo,
         extra_args=extra_args,
-        no_ray=getattr(args, "no_ray", False),
+        use_ray=use_ray,
     )
 
     if args.dry_run:
@@ -1205,13 +1354,20 @@ Examples:
         cmd_parts = ["   ./launch-cluster.sh", "-t", container]
         for mod in recipe.get("mods", []):
             cmd_parts.extend(["--apply-mod", mod])
+        for layer_type, value in cli_launch_layers:
+            if layer_type == "apply_mods":
+                cmd_parts.extend(["--apply-mod", value])
+            else:
+                cmd_parts.extend(["--apply-vllm-pr", value])
         if args.solo:
             cmd_parts.append("--solo")
         elif not is_cluster:
             cmd_parts.append("--solo")
         if args.daemon:
             cmd_parts.append("-d")
-        if getattr(args, "no_ray", False):
+        if use_ray:
+            cmd_parts.append("--ray")
+        elif getattr(args, "no_ray", False):
             cmd_parts.append("--no-ray")
         if nodes:
             cmd_parts.extend(["-n", ",".join(nodes)])
@@ -1219,6 +1375,10 @@ Examples:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
         for env_var in args.env_vars:
             cmd_parts.extend(["-e", env_var])
+        for port_mapping in args.port_mappings:
+            cmd_parts.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd_parts.extend(["-v", volume_mapping])
         if args.master_port:
             cmd_parts.extend(["--master-port", str(args.master_port)])
         effective_container_name = args.container_name or recipe.get("container_name")
@@ -1232,6 +1392,12 @@ Examples:
             cmd_parts.extend(["-j", str(args.build_jobs)])
         if args.no_cache_dirs:
             cmd_parts.append("--no-cache-dirs")
+        if args.keep_entrypoint:
+            cmd_parts.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd_parts.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd_parts.extend(["--earlyoom-args", args.earlyoom_args])
         if args.non_privileged:
             cmd_parts.append("--non-privileged")
         if args.mem_limit_gb:
@@ -1267,6 +1433,16 @@ Examples:
             if not mod_path.exists():
                 print(f"Warning: Mod path not found: {mod_path}")
             cmd.extend(["--apply-mod", str(mod_path)])
+        for layer_type, value in cli_launch_layers:
+            if layer_type == "apply_mods":
+                mod_path = Path(value).expanduser()
+                if not mod_path.is_absolute():
+                    mod_path = Path.cwd() / mod_path
+                if not mod_path.exists():
+                    print(f"Warning: Mod path not found: {mod_path}")
+                cmd.extend(["--apply-mod", str(mod_path)])
+            else:
+                cmd.extend(["--apply-vllm-pr", value])
 
         # Add launch options
         if args.solo:
@@ -1278,7 +1454,9 @@ Examples:
         if args.daemon:
             cmd.append("-d")
 
-        if getattr(args, "no_ray", False):
+        if use_ray:
+            cmd.append("--ray")
+        elif getattr(args, "no_ray", False):
             cmd.append("--no-ray")
 
         # Pass nodes to launch-cluster.sh (from command line, .env, or autodiscover)
@@ -1290,6 +1468,11 @@ Examples:
 
         for env_var in args.env_vars:
             cmd.extend(["-e", env_var])
+
+        for port_mapping in args.port_mappings:
+            cmd.extend(["-p", port_mapping])
+        for volume_mapping in args.volume_mappings:
+            cmd.extend(["-v", volume_mapping])
 
         if args.master_port:
             cmd.extend(["--master-port", str(args.master_port)])
@@ -1304,6 +1487,12 @@ Examples:
             cmd.extend(["-j", str(args.build_jobs)])
         if args.no_cache_dirs:
             cmd.append("--no-cache-dirs")
+        if args.keep_entrypoint:
+            cmd.append("--keep-entrypoint")
+        if args.earlyoom:
+            cmd.append("--earlyoom")
+        if args.earlyoom_args:
+            cmd.extend(["--earlyoom-args", args.earlyoom_args])
         if args.non_privileged:
             cmd.append("--non-privileged")
         if args.mem_limit_gb:
@@ -1323,8 +1512,11 @@ Examples:
 
         print(f"=== Launching ===")
         print(f"Container: {container}")
-        if recipe.get("mods"):
-            print(f"Mods: {', '.join(recipe['mods'])}")
+        all_mods = recipe.get("mods", []) + cli_mods
+        if all_mods:
+            print(f"Mods: {', '.join(all_mods)}")
+        if cli_vllm_prs:
+            print(f"Runtime vLLM PRs: {', '.join(cli_vllm_prs)}")
         if is_cluster:
             print(f"Cluster: {len(nodes)} nodes")
         else:

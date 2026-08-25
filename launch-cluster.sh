@@ -4,8 +4,12 @@
 IMAGE_NAME="vllm-node"
 DEFAULT_CONTAINER_NAME="vllm_node"
 HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
+CONTAINER_WORKSPACE_DIR="/workspace"
+CONTAINER_EXEC_SCRIPT="$CONTAINER_WORKSPACE_DIR/exec-script.sh"
 # Modify these if you want to pass additional docker args or set VLLM_SPARK_EXTRA_DOCKER_ARGS variable
-DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1 -v $HF_CACHE_DIR:/root/.cache/huggingface"
+DOCKER_ARGS="-e NCCL_IGNORE_CPU_AFFINITY=1"
+DOCKER_ARGS="$DOCKER_ARGS -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+DOCKER_ARGS="$DOCKER_ARGS -v $HF_CACHE_DIR:/root/.cache/huggingface"
 
 # Append additional arguments from environment variable
 if [[ -n "$VLLM_SPARK_EXTRA_DOCKER_ARGS" ]]; then
@@ -28,13 +32,17 @@ ACTION=""
 CLUSTER_WAS_RUNNING="false"
 MOD_PATHS=()
 MOD_TYPES=()
+VLLM_PRS_REQUESTED="false"
+GENERATED_MOD_ROOT=""
 LAUNCH_SCRIPT_PATH=""
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 CONFIG_FILE=""  # Will be set to default after argument parsing
 
 ACTIONS_ARG=""
 SOLO_MODE="false"
-NO_RAY_MODE="false"
+NO_RAY_MODE="true"
+NO_RAY_EXPLICIT="false"
+RAY_MODE_EXPLICIT="false"
 LAUNCH_SCRIPT_MODE="false"
 MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
@@ -45,10 +53,15 @@ MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
 SHM_SIZE_GB="64"
 IS_REMOTE_HEAD="false"  # true when LOCAL_IP from .env is not this machine
+NOFILE_LIMIT="${VLLM_SPARK_NOFILE_LIMIT:-1048576}"
+PORT_MAPPINGS=()
+VOLUME_MAPPINGS=()
+ENABLE_EARLYOOM="false"
+EARLYOOM_ARGS="${VLLM_SPARK_EARLYOOM_ARGS:--M 524288,102400 -s 100 -r 60}"
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [-d] [action] [command]"
+    echo "Usage: $0 [-n <node_ips>] [-t <image_name>] [--name <container_name>] [--eth-if <if_name>] [--ib-if <if_name>] [--nccl-debug <level>] [--check-config] [--solo] [--ray|--no-ray] [-p <host:container>] [-v <local:container>] [-d] [action] [command]"
     echo "  -n, --nodes     Comma-separated list of node IPs (Optional, auto-detected if omitted)"
     echo "  -t              Docker image name (Optional, default: $IMAGE_NAME)"
     echo "  --name          Container name (Optional, default: $DEFAULT_CONTAINER_NAME)"
@@ -58,13 +71,19 @@ usage() {
     echo "  -j              Number of parallel jobs for build environment variables (optional)"
     echo "  --nccl-debug    NCCL debug level (Optional, one of: VERSION, WARN, INFO, TRACE). If no level is provided, defaults to INFO."
     echo "  --apply-mod     Path to directory or zip file containing run.sh to apply before launch (Can be specified multiple times)"
+    echo "  --apply-vllm-pr Apply an upstream vLLM PR to the installed runtime package before launch (Can be specified multiple times)"
     echo "  --launch-script Path to bash script to execute in the container (from examples/ directory or absolute path). If launch script is specified, action should be omitted."
     echo "  --check-config  Check configuration and auto-detection without launching"
     echo "  --solo          Solo mode: skip autodetection, launch only on current node, do not launch Ray cluster"
     echo "  --master-port   Port for cluster coordination: Ray head port or PyTorch distributed master port (default: 29501)"
-    echo "  --no-ray        No-Ray mode: run multi-node vLLM without Ray (uses PyTorch distributed backend)"
-    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton)"
+    echo "  -p, --publish   Publish a container port in Docker format (e.g. -p 8000:8000). Solo mode only; can be specified multiple times."
+    echo "  -v, --volume    Map a volume in Docker format (e.g. -v /local/path:/container/path). Can be specified multiple times."
+    echo "  --ray           Use Ray for multi-node vLLM and add --distributed-executor-backend ray if missing"
+    echo "  --no-ray        Default for multi-node vLLM without Ray (accepted for compatibility)"
+    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.triton, ~/.tilelang)"
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
+    echo "  --earlyoom      Run earlyoom as the container foreground process instead of sleep infinity"
+    echo "  --earlyoom-args Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')"
     echo "  -d              Daemon mode (only for 'start' action)"
     echo "  --non-privileged Run in non-privileged mode (removes --privileged and --ipc=host)"
     echo "  --mem-limit-gb  Memory limit in GB (default: 110, only with --non-privileged)"
@@ -75,6 +94,15 @@ usage() {
   --setup/--discover  Force autodiscovery and save configuration (even if .env exists)"
     echo "  action          start | stop | status | exec (Default: start). Not compatible with --launch-script."
     echo "  command         Command to run (only for 'exec' action). Not compatible with --launch-script."
+    echo ""
+    echo "Environment overrides:"
+    echo "  VLLM_SPARK_NOFILE_LIMIT  Docker nofile ulimit for containers (default: 1048576)"
+    echo ""
+    echo "vLLM serve orchestration:"
+    echo "  The launcher uses .env when present and autodiscovers when it is absent."
+    echo "  Do not pass --distributed-executor-backend, --nnodes, --node-rank,"
+    echo "  --master-addr, --master-port, or --headless to vllm serve; the launcher"
+    echo "  adds the backend and per-node multiprocessing arguments automatically."
     echo ""
     echo "Supported .env file variables:"
     echo "  CLUSTER_NODES       Comma-separated list of node IPs"
@@ -112,7 +140,17 @@ while [[ "$#" -gt 0 ]]; do
         --ib-if) IB_IF="$2"; shift ;;
         -e|--env) DOCKER_ARGS="$DOCKER_ARGS -e $2"; shift ;;
         -j) BUILD_JOBS="$2"; shift ;;
-        --apply-mod) MOD_PATHS+=("$2"); shift ;;
+        --apply-mod) MOD_PATHS+=("$2"); MOD_TYPES+=("path"); shift ;;
+        --apply-vllm-pr)
+            if [[ -z "${2:-}" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --apply-vllm-pr requires a positive integer PR number."
+                exit 1
+            fi
+            MOD_PATHS+=("$2")
+            MOD_TYPES+=("vllm-pr")
+            VLLM_PRS_REQUESTED="true"
+            shift
+            ;;
         --launch-script) LAUNCH_SCRIPT_PATH="$2"; shift ;;
         --nccl-debug)
             if [[ -n "$2" && "$2" =~ ^(VERSION|WARN|INFO|TRACE)$ ]]; then
@@ -123,11 +161,33 @@ while [[ "$#" -gt 0 ]]; do
             fi
             ;;
         --master-port|--head-port) MASTER_PORT="$2"; shift ;;
+        -p|--publish) PORT_MAPPINGS+=("$2"); shift ;;
+        -p=*|--publish=*) PORT_MAPPINGS+=("${1#*=}") ;;
+        -v|--volume) VOLUME_MAPPINGS+=("$2"); shift ;;
+        -v=*|--volume=*) VOLUME_MAPPINGS+=("${1#*=}") ;;
         --check-config) CHECK_CONFIG="true" ;;
         --solo) SOLO_MODE="true" ;;
-        --no-ray) NO_RAY_MODE="true" ;;
+        --ray)
+            if [[ "$NO_RAY_EXPLICIT" == "true" ]]; then
+                echo "Error: --ray and --no-ray are mutually exclusive."
+                exit 1
+            fi
+            NO_RAY_MODE="false"
+            RAY_MODE_EXPLICIT="true"
+            ;;
+        --no-ray)
+            if [[ "$RAY_MODE_EXPLICIT" == "true" ]]; then
+                echo "Error: --ray and --no-ray are mutually exclusive."
+                exit 1
+            fi
+            NO_RAY_MODE="true"
+            NO_RAY_EXPLICIT="true"
+            ;;
         --no-cache-dirs) MOUNT_CACHE_DIRS="false" ;;
         --keep-entrypoint) KEEP_ENTRYPOINT="true" ;;
+        --earlyoom) ENABLE_EARLYOOM="true" ;;
+        --earlyoom-args) ENABLE_EARLYOOM="true"; EARLYOOM_ARGS="$2"; shift ;;
+        --earlyoom-args=*) ENABLE_EARLYOOM="true"; EARLYOOM_ARGS="${1#*=}" ;;
         --non-privileged) NON_PRIVILEGED_MODE="true" ;;
         --mem-limit-gb) MEM_LIMIT_GB="$2"; shift ;;
         --mem-swap-limit-gb) MEM_SWAP_LIMIT_GB="$2"; shift ;;
@@ -287,6 +347,17 @@ else
     done
 fi
 
+if [[ "$ENABLE_EARLYOOM" == "true" && "$KEEP_ENTRYPOINT" == "true" ]]; then
+    echo "Error: --earlyoom requires launch-cluster.sh to clear the image entrypoint."
+    echo "       Remove --keep-entrypoint so earlyoom can run as the foreground process."
+    exit 1
+fi
+
+if ! [[ "$NOFILE_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: VLLM_SPARK_NOFILE_LIMIT must be a positive integer, got: $NOFILE_LIMIT"
+    exit 1
+fi
+
 # Append NCCL_DEBUG if set, with validation
 if [[ -n "$NCCL_DEBUG_VAL" ]]; then
     case "$NCCL_DEBUG_VAL" in
@@ -343,7 +414,17 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     # Triton Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.triton:/root/.triton"
     CACHE_DIRS_TO_CREATE+=("$HOME/.triton")
+
+    # TileLang Cache
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.tilelang:/root/.tilelang"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.tilelang")
 fi
+
+# Pass user-provided mappings through unchanged so Docker handles its native
+# local_path:container_path[:options] syntax.
+for mapping in "${VOLUME_MAPPINGS[@]}"; do
+    DOCKER_ARGS="$DOCKER_ARGS -v $mapping"
+done
 
 # Resolve launch script path if specified
 if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
@@ -368,7 +449,7 @@ if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
     echo "Using launch script: $LAUNCH_SCRIPT_PATH"
     
     # Set command to run the copied script (use absolute path since docker exec may not be in /workspace)
-    COMMAND_TO_RUN="/workspace/exec-script.sh"
+    COMMAND_TO_RUN="$CONTAINER_EXEC_SCRIPT"
     LAUNCH_SCRIPT_MODE="true"
 
     # If launch script is specified, default action to exec unless explicitly set to stop/status
@@ -380,6 +461,9 @@ fi
 # Validate MOD_PATHS if set
 for i in "${!MOD_PATHS[@]}"; do
     mod_path="${MOD_PATHS[$i]}"
+    if [[ "${MOD_TYPES[$i]}" == "vllm-pr" ]]; then
+        continue
+    fi
     if [[ ! -e "$mod_path" ]]; then
         echo "Error: Mod path '$mod_path' does not exist."
         exit 1
@@ -506,9 +590,24 @@ if [[ "$SOLO_MODE" == "false" && ${#PEER_NODES[@]} -eq 0 ]]; then
     SOLO_MODE="true"
 fi
 
+if [[ "$SOLO_MODE" == "true" ]]; then
+    if [[ "$RAY_MODE_EXPLICIT" == "true" ]]; then
+        echo "Error: --ray is incompatible with --solo or a single-node configuration."
+        exit 1
+    fi
+    if [[ "$NO_RAY_EXPLICIT" == "true" ]]; then
+        echo "Error: --no-ray is incompatible with --solo or a single-node configuration."
+        exit 1
+    fi
+fi
+
 if [[ "$NO_RAY_MODE" == "true" && "$SOLO_MODE" == "true" ]]; then
-    echo "Warning: Only one node detected; --no-ray has no effect in solo mode. Proceeding normally."
     NO_RAY_MODE="false"
+fi
+
+if [[ ${#PORT_MAPPINGS[@]} -gt 0 && "$SOLO_MODE" != "true" ]]; then
+    echo "Error: -p/--publish port forwarding is only supported in solo mode. Use --solo or remove port mappings for cluster mode."
+    exit 1
 fi
 
 echo "Head Node: $HEAD_IP"
@@ -544,10 +643,22 @@ if [[ "$CHECK_CONFIG" == "true" ]]; then
     echo "  ETH Interface: $ETH_IF"
     echo "  IB Interface: $IB_IF"
     echo "  Docker Args: $DOCKER_ARGS"
+    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        echo "  Docker Network: default bridge with published ports: ${PORT_MAPPINGS[*]}"
+    else
+        echo "  Docker Network: host"
+    fi
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
          echo "  Mounting Cache Dirs: ${CACHE_DIRS_TO_CREATE[*]}"
     else
          echo "  Mounting Cache Dirs: (Disabled)"
+    fi
+    if [[ "$VLLM_PRS_REQUESTED" == "true" ]]; then
+        runtime_prs=()
+        for i in "${!MOD_PATHS[@]}"; do
+            [[ "${MOD_TYPES[$i]}" == "vllm-pr" ]] && runtime_prs+=("${MOD_PATHS[$i]}")
+        done
+        echo "  Runtime vLLM PRs: ${runtime_prs[*]}"
     fi
     exit 0
 fi
@@ -607,10 +718,27 @@ head_docker_cp_dir() {
     fi
 }
 
+# Remove temporary, generated PR mods without touching user-provided mod paths.
+cleanup_generated_mods() {
+    if [[ -n "$GENERATED_MOD_ROOT" && -d "$GENERATED_MOD_ROOT" ]]; then
+        case "$GENERATED_MOD_ROOT" in
+            /tmp/vllm-runtime-pr-mod.*)
+                rm -rf -- "$GENERATED_MOD_ROOT"
+                ;;
+            *)
+                echo "Warning: Refusing to remove unexpected generated mod path: $GENERATED_MOD_ROOT" >&2
+                ;;
+        esac
+    fi
+    GENERATED_MOD_ROOT=""
+}
+
 # Cleanup Function
 cleanup() {
     # Remove traps to prevent nested cleanup
     trap - EXIT INT TERM HUP
+
+    cleanup_generated_mods
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
         echo "Cluster was already running when script started. Skipping cleanup."
@@ -670,6 +798,10 @@ fi
 # Only trap if we are NOT in daemon mode (container should persist in daemon mode)
 if [[ "$DAEMON_MODE" == "false" ]]; then
     trap cleanup EXIT INT TERM HUP
+else
+    # Daemon mode deliberately leaves containers running, but host-side generated
+    # PR bundles are always temporary.
+    trap cleanup_generated_mods EXIT INT TERM HUP
 fi
 
 # Check if cluster is already running
@@ -695,6 +827,245 @@ check_cluster_running() {
         CLUSTER_WAS_RUNNING="true"
         return 0
     fi
+}
+
+download_vllm_pr_diff() {
+    local pr_number="$1"
+    local destination="$2"
+    local url="https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/${pr_number}.diff"
+
+    echo "Fetching upstream vLLM PR #${pr_number}..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --retry-delay 1 "$url" -o "$destination"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$destination" "$url"
+    else
+        echo "Error: curl or wget is required to fetch vLLM PR patches." >&2
+        return 1
+    fi
+
+    if [[ ! -s "$destination" ]]; then
+        echo "Error: Downloaded patch for vLLM PR #${pr_number} is empty." >&2
+        return 1
+    fi
+}
+
+validate_vllm_runtime_diff() {
+    local pr_number="$1"
+    local patch_file="$2"
+
+    python3 - "$pr_number" "$patch_file" <<'PY'
+from __future__ import annotations
+
+import shlex
+import sys
+from pathlib import Path
+
+pr_number = sys.argv[1]
+patch_file = Path(sys.argv[2])
+runtime_paths: set[str] = set()
+ignored_paths: set[str] = set()
+unsupported_paths: set[str] = set()
+
+ignored_prefixes = (
+    ".github/",
+    "benchmarks/",
+    "docs/",
+    "examples/",
+    "tests/",
+)
+native_suffixes = {
+    ".a",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cu",
+    ".cuh",
+    ".cxx",
+    ".h",
+    ".hpp",
+    ".o",
+    ".so",
+}
+
+for line in patch_file.read_text(errors="replace").splitlines():
+    if not line.startswith("diff --git "):
+        continue
+    try:
+        fields = shlex.split(line)
+    except ValueError as exc:
+        raise SystemExit(
+            f"Error: Could not parse vLLM PR #{pr_number} diff header: {exc}"
+        ) from exc
+    if len(fields) != 4:
+        raise SystemExit(
+            f"Error: Unexpected vLLM PR #{pr_number} diff header: {line}"
+        )
+
+    for raw_path in fields[2:4]:
+        path = raw_path[2:] if raw_path.startswith(("a/", "b/")) else raw_path
+        if path == "/dev/null":
+            continue
+        if path.startswith(ignored_prefixes) or Path(path).suffix.lower() in {".md", ".rst"}:
+            ignored_paths.add(path)
+        elif path.startswith("vllm/"):
+            name = Path(path).name
+            if Path(path).suffix.lower() in native_suffixes or name in {
+                "CMakeLists.txt",
+                "Makefile",
+            }:
+                unsupported_paths.add(path)
+            else:
+                runtime_paths.add(path)
+        else:
+            unsupported_paths.add(path)
+
+if unsupported_paths:
+    rendered = "\n  - ".join(sorted(unsupported_paths))
+    raise SystemExit(
+        f"Error: vLLM PR #{pr_number} is not runtime-only. It changes files that "
+        f"require a source build or cannot be installed safely at launch:\n  - {rendered}\n"
+        f"Use build-and-copy.sh --apply-vllm-pr {pr_number} instead."
+    )
+
+if not runtime_paths:
+    raise SystemExit(
+        f"Error: vLLM PR #{pr_number} has no applicable files under vllm/. "
+        f"Use the build-time --apply-vllm-pr path if the PR is still required."
+    )
+
+print(
+    f"Validated vLLM PR #{pr_number} for runtime application: "
+    f"{len(runtime_paths)} package path(s), {len(ignored_paths)} test/docs path(s) ignored."
+)
+PY
+}
+
+write_vllm_pr_mod_runner() {
+    local destination="$1"
+
+    cat > "$destination" <<'RUN_SH'
+#!/bin/bash
+set -euo pipefail
+
+MOD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PR_NUMBER="$(tr -d '\r\n' < "$MOD_DIR/pr-number")"
+PATCH_FILE="$MOD_DIR/pr.diff"
+EXPECTED_SHA256="$(tr -d '\r\n' < "$MOD_DIR/pr.sha256")"
+PREFIX="[vllm-pr #${PR_NUMBER}]"
+
+if ! command -v git >/dev/null 2>&1; then
+    echo "$PREFIX git is required to apply this runtime PR." >&2
+    echo "$PREFIX Apply mods/use-official-vllm before --apply-vllm-pr when using an image without git." >&2
+    exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "$PREFIX python3 is required to locate the installed vLLM package." >&2
+    exit 1
+fi
+
+ACTUAL_SHA256="$(python3 - "$PATCH_FILE" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+    echo "$PREFIX Patch checksum mismatch; refusing to apply it." >&2
+    exit 1
+fi
+
+VLLM_PACKAGE_DIR="${VLLM_PACKAGE_DIR:-$(python3 - <<'PY'
+from importlib.util import find_spec
+
+spec = find_spec("vllm")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("Could not locate the installed vLLM package")
+print(next(iter(spec.submodule_search_locations)))
+PY
+)}"
+
+if [[ ! -d "$VLLM_PACKAGE_DIR" || "$(basename "$VLLM_PACKAGE_DIR")" != "vllm" ]]; then
+    echo "$PREFIX Invalid installed vLLM package directory: $VLLM_PACKAGE_DIR" >&2
+    exit 1
+fi
+
+PYTHON_ROOT="$(dirname "$VLLM_PACKAGE_DIR")"
+cd "$PYTHON_ROOT"
+APPLY_ARGS=(--binary --include='vllm/**')
+
+echo "$PREFIX Applying validated runtime patch $EXPECTED_SHA256 to $VLLM_PACKAGE_DIR"
+if git apply --reverse --check "${APPLY_ARGS[@]}" "$PATCH_FILE" >/dev/null 2>&1; then
+    echo "$PREFIX Patch is already applied; skipping."
+elif git apply --check "${APPLY_ARGS[@]}" "$PATCH_FILE"; then
+    git apply "${APPLY_ARGS[@]}" "$PATCH_FILE"
+    echo "$PREFIX Applied successfully."
+else
+    echo "$PREFIX Patch does not apply cleanly to the installed vLLM package." >&2
+    echo "$PREFIX Rebuild with build-and-copy.sh --apply-vllm-pr $PR_NUMBER if this PR is not runtime-compatible." >&2
+    exit 1
+fi
+RUN_SH
+    chmod +x "$destination"
+}
+
+prepare_vllm_pr_mods() {
+    if [[ "$VLLM_PRS_REQUESTED" != "true" ]]; then
+        return 0
+    fi
+
+    GENERATED_MOD_ROOT="$(mktemp -d /tmp/vllm-runtime-pr-mod.XXXXXX)" || {
+        echo "Error: Could not create a temporary directory for runtime vLLM PR mods." >&2
+        return 1
+    }
+    local cache_dir="$GENERATED_MOD_ROOT/cache"
+    mkdir -p "$cache_dir"
+
+    local i
+    for i in "${!MOD_PATHS[@]}"; do
+        if [[ "${MOD_TYPES[$i]}" != "vllm-pr" ]]; then
+            continue
+        fi
+
+        local pr_number="${MOD_PATHS[$i]}"
+        local bundle_dir="$GENERATED_MOD_ROOT/vllm-pr-${pr_number}-${i}"
+        local patch_file="$bundle_dir/pr.diff"
+        local cached_patch="$cache_dir/pr-${pr_number}.diff"
+        local cached_sha256="$cache_dir/pr-${pr_number}.sha256"
+        mkdir -p "$bundle_dir"
+
+        if [[ ! -f "$cached_patch" ]]; then
+            if ! download_vllm_pr_diff "$pr_number" "$cached_patch"; then
+                cleanup_generated_mods
+                return 1
+            fi
+            if ! validate_vllm_runtime_diff "$pr_number" "$cached_patch"; then
+                cleanup_generated_mods
+                return 1
+            fi
+            python3 - "$cached_patch" > "$cached_sha256" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+        fi
+
+        local patch_sha256
+        patch_sha256="$(tr -d '\r\n' < "$cached_sha256")"
+        cp "$cached_patch" "$patch_file"
+        printf '%s\n' "$pr_number" > "$bundle_dir/pr-number"
+        printf '%s\n' "$patch_sha256" > "$bundle_dir/pr.sha256"
+        write_vllm_pr_mod_runner "$bundle_dir/run.sh"
+
+        echo "Prepared runtime vLLM PR #${pr_number} (SHA-256: ${patch_sha256})."
+        MOD_PATHS[$i]="$bundle_dir"
+        MOD_TYPES[$i]="dir"
+    done
 }
 
 # Apply Mod Function
@@ -733,26 +1104,33 @@ apply_mod_to_container() {
         if [[ "$mod_type" == "zip" ]]; then
              if ! scp -o BatchMode=yes -o StrictHostKeyChecking=no "$mod_path" "$node_ip:$remote_tmp/"; then
                 echo "Error: Failed to copy mod to $node_ip"
-                exit 1
+                return 1
              fi
              target_mod_path="$remote_tmp/$(basename "$mod_path")"
         else
              if ! scp -r -o BatchMode=yes -o StrictHostKeyChecking=no "$mod_path"/* "$node_ip:$remote_tmp/"; then
                 echo "Error: Failed to copy mod to $node_ip"
-                exit 1
+                return 1
              fi
              target_mod_path="$remote_tmp"
         fi
     fi
 
     # 2. Copy into container
-    local container_dest="/workspace/mods/$mod_name"
+    local container_dest="$CONTAINER_WORKSPACE_DIR/mods/$mod_name"
+
+    # Command prefix for remote vs local
     local cmd_prefix=""
     if [[ "$node_is_local" == "false" ]]; then
         cmd_prefix="ssh -o BatchMode=yes -o StrictHostKeyChecking=no $node_ip"
     fi
 
-    $cmd_prefix docker exec "$container" mkdir -p "$container_dest"
+    # Create workspace in container. Run from / because some images configure
+    # /workspace as WORKDIR but do not create it, which breaks docker exec.
+    $cmd_prefix docker exec -w / "$container" mkdir -p "$container_dest" || {
+        echo "Error: Failed to create $container_dest in container on $node_ip"
+        return 1
+    }
 
     if [[ "$mod_type" == "zip" ]]; then
         local zip_name=$(basename "$mod_path")
@@ -776,6 +1154,10 @@ apply_mod_to_container() {
 
     # 3. Run run.sh
     echo "  Running patch script on $node_ip..."
+
+    # Preserve the container's default cwd for mods that copy files next to
+    # the eventual vLLM launch. The /workspace creation above only makes that
+    # default cwd safe for images that declare it but do not create it.
     local local_exec_cmd="export WORKSPACE_DIR=\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
     local remote_exec_cmd="export WORKSPACE_DIR=\\\$PWD && cd $container_dest && chmod +x run.sh && ./run.sh"
     local ret_code=0
@@ -790,7 +1172,7 @@ apply_mod_to_container() {
 
     if [[ $ret_code -ne 0 ]]; then
         echo "Error: Patch script failed on $node_ip"
-        exit 1
+        return 1
     fi
 
     # 4. Cleanup remote temp
@@ -825,6 +1207,45 @@ parse_parallelism_from_text() {
     done
 }
 
+command_needs_ray_backend() {
+    local text="$1"
+    local serve_re='(^|[[:space:]])vllm[[:space:]]+serve([[:space:]]|$)'
+    local backend_re='--distributed-executor-backend(=|[[:space:]]|$)'
+
+    if [[ "$text" =~ $serve_re ]] && [[ ! "$text" =~ $backend_re ]]; then
+        return 0
+    fi
+    return 1
+}
+
+ensure_ray_backend_command() {
+    local cmd="$1"
+    if command_needs_ray_backend "$cmd"; then
+        echo "Adding --distributed-executor-backend ray for Ray mode." >&2
+        printf '%s --distributed-executor-backend ray' "$cmd"
+    else
+        printf '%s' "$cmd"
+    fi
+}
+
+make_ray_script() {
+    local script_path="$1"
+    local content
+    content=$(cat "$script_path" 2>/dev/null || true)
+
+    if command_needs_ray_backend "$content"; then
+        echo "Adding --distributed-executor-backend ray to launch script for Ray mode." >&2
+        local tmp; tmp=$(mktemp /tmp/vllm_ray_script_XXXXXX.sh)
+        cp "$script_path" "$tmp"
+        sed -i "$ s/[[:space:]]*\\\\[[:space:]]*$//" "$tmp"
+        sed -i "$ s/$/ --distributed-executor-backend ray/" "$tmp"
+        chmod +x "$tmp"
+        echo "$tmp"
+    else
+        echo "$script_path"
+    fi
+}
+
 # Build a patched copy of the launch script on the host for a specific node.
 # Strips --distributed-executor-backend and appends multi-node args.
 # Prints the path of the temp file (caller must delete it).
@@ -835,7 +1256,7 @@ make_node_script() {
 
     local tmp; tmp=$(mktemp /tmp/vllm_node_script_XXXXXX.sh)
     # Remove just the flag and its value (not the whole line), then filter empty/backslash-only lines
-    sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//' "$script_path" | \
+    sed -E 's/--distributed-executor-backend(=|[[:space:]]+)[^[:space:]]+//g' "$script_path" | \
         grep -Ev '^[[:space:]\\]*$' > "$tmp"
     # Strip trailing backslash from last line before appending multi-node args
     sed -i "$ s/[[:space:]]*\\\\[[:space:]]*$//" "$tmp"
@@ -844,20 +1265,39 @@ make_node_script() {
     echo "$tmp"
 }
 
-# Copy a script file into a head node container as /workspace/exec-script.sh
+ensure_container_workspace() {
+    local node_ip="$1"; local container="$2"; local is_local="$3"
+
+    if [[ "$is_local" == "true" ]]; then
+        docker exec -w / "$container" mkdir -p "$CONTAINER_WORKSPACE_DIR" || {
+            echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
+            exit 1
+        }
+    else
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node_ip" \
+            "docker exec -w / $container mkdir -p $CONTAINER_WORKSPACE_DIR" || {
+            echo "Error: Failed to create $CONTAINER_WORKSPACE_DIR in container on $node_ip"
+            exit 1
+        }
+    fi
+}
+
+# Copy a script file into a head node container as $CONTAINER_EXEC_SCRIPT
 copy_script_to_container() {
     local container="$1"; local script_path="$2"; local label="${3:-node}"
     echo "Copying launch script to $label..."
     if [[ "$IS_REMOTE_HEAD" == "true" ]]; then
         local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
+        ensure_container_workspace "$HEAD_IP" "$container" "false"
         scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$HEAD_IP:$remote_tmp" || { echo "Error: scp to head $HEAD_IP failed"; exit 1; }
         ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$HEAD_IP" \
-            "docker cp $remote_tmp $container:/workspace/exec-script.sh && \
-             docker exec $container chmod +x /workspace/exec-script.sh && \
+            "docker cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
+             docker exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
              rm -f $remote_tmp" || { echo "Error: docker cp to head $HEAD_IP failed"; exit 1; }
     else
-        docker cp "$script_path" "$container:/workspace/exec-script.sh" || { echo "Error: docker cp to $label failed"; exit 1; }
-        docker exec "$container" chmod +x /workspace/exec-script.sh
+        ensure_container_workspace "$HEAD_IP" "$container" "true"
+        docker cp "$script_path" "$container:$CONTAINER_EXEC_SCRIPT" || { echo "Error: docker cp to $label failed"; exit 1; }
+        docker exec -w / "$container" chmod +x "$CONTAINER_EXEC_SCRIPT"
     fi
 }
 
@@ -866,10 +1306,11 @@ copy_script_to_worker() {
     local worker_ip="$1"; local container="$2"; local script_path="$3"
     echo "Copying launch script to worker $worker_ip..."
     local remote_tmp="/tmp/vllm_script_$(date +%s)_$RANDOM.sh"
+    ensure_container_workspace "$worker_ip" "$container" "false"
     scp -o BatchMode=yes -o StrictHostKeyChecking=no "$script_path" "$worker_ip:$remote_tmp" || { echo "Error: scp to $worker_ip failed"; exit 1; }
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
-        "docker cp $remote_tmp $container:/workspace/exec-script.sh && \
-         docker exec $container chmod +x /workspace/exec-script.sh && \
+        "docker cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
+         docker exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
 
@@ -913,13 +1354,76 @@ start_ray_worker() {
           --address=$HEAD_IP:$MASTER_PORT --node-ip-address $worker_ip >> /proc/1/fd/1 2>&1'"
 }
 
+container_keepalive_command() {
+    if [[ "$ENABLE_EARLYOOM" == "true" ]]; then
+        printf 'earlyoom %s' "$EARLYOOM_ARGS"
+    else
+        printf 'sleep infinity'
+    fi
+}
+
+# Verify that the selected image resolves to the same content-addressable image
+# ID on the head and every worker before starting any containers.
+verify_cluster_image_consistency() {
+    if [[ ${#PEER_NODES[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    echo "Verifying Docker image consistency across cluster nodes..."
+
+    local head_image_id
+    if ! head_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
+        echo "Error: Could not inspect image '$IMAGE_NAME' on head node ($HEAD_IP)."
+        echo "       Make sure the image exists and is accessible to the current user."
+        return 1
+    fi
+    echo "  [HEAD] $HEAD_IP: $head_image_id"
+
+    local inspect_cmd
+    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+
+    local worker
+    local worker_image_id
+    local image_error=false
+    for worker in "${PEER_NODES[@]}"; do
+        if ! worker_image_id=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker" "$inspect_cmd" 2>/dev/null) || [[ -z "$worker_image_id" ]]; then
+            echo "Error: Could not inspect image '$IMAGE_NAME' on worker node ($worker)."
+            echo "       The image may be missing or inaccessible to the remote user."
+            image_error=true
+        elif [[ "$worker_image_id" != "$head_image_id" ]]; then
+            echo "Error: Docker image mismatch on worker node ($worker):"
+            echo "       Head:   $head_image_id"
+            echo "       Worker: $worker_image_id"
+            image_error=true
+        else
+            echo "  [WORKER] $worker: $worker_image_id (match)"
+        fi
+    done
+
+    if [[ "$image_error" == "true" ]]; then
+        echo "Error: Cluster launch aborted because image '$IMAGE_NAME' is not in sync."
+        printf "       Sync it with: ./build-and-copy.sh --no-build -t %q --copy-to <worker-hosts>\n" "$IMAGE_NAME"
+        return 1
+    fi
+
+    echo "Docker image consistency check passed."
+}
+
 # Start Cluster Function
 start_cluster() {
     check_cluster_running
 
     if [[ "$CLUSTER_WAS_RUNNING" == "true" ]]; then
+        if [[ "$VLLM_PRS_REQUESTED" == "true" ]]; then
+            echo "Error: --apply-vllm-pr cannot be verified or applied because cluster containers are already running." >&2
+            echo "       Stop and recreate the cluster to apply the requested runtime PR layer." >&2
+            return 1
+        fi
         return
     fi
+
+    verify_cluster_image_consistency || return 1
+    prepare_vllm_pr_mods || return 1
 
     # Build docker run arguments based on mode
     local docker_entrypoint_args=""
@@ -927,18 +1431,28 @@ start_cluster() {
         docker_entrypoint_args="--entrypoint="
     fi
 
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_network_args="--network host"
+    if [[ ${#PORT_MAPPINGS[@]} -gt 0 ]]; then
+        docker_network_args=""
+        for mapping in "${PORT_MAPPINGS[@]}"; do
+            docker_network_args="$docker_network_args -p $mapping"
+        done
+    fi
+
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
     if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
         echo "Running in non-privileged mode..."
         docker_caps_args="--cap-add=IPC_LOCK"
-        docker_resource_args="--shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --shm-size=${SHM_SIZE_GB}g --device=/dev/infiniband --memory ${MEM_LIMIT_GB}g --memory-swap ${MEM_SWAP_LIMIT_GB}g --pids-limit ${PIDS_LIMIT}"
     else
         docker_caps_args="--privileged"
-        docker_resource_args="--ipc=host"
+        docker_resource_args="--ulimit nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT} --ipc=host"
     fi
+    local keepalive_cmd
+    keepalive_cmd="$(container_keepalive_command)"
 
     # Start Head Node
     echo "Starting Head Node on $HEAD_IP..."
@@ -947,7 +1461,7 @@ start_cluster() {
             run_on_head "mkdir -p $dir"
         done
     fi
-    local docker_run_head="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$HEAD_IP") $docker_args_common sleep infinity"
+local docker_run_head="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$HEAD_IP") $docker_args_common $keepalive_cmd"
     run_on_head "$docker_run_head"
 
     # Start Worker Nodes
@@ -957,21 +1471,28 @@ start_cluster() {
             ssh "$worker" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
         fi
         local docker_run_cmd="docker run $docker_caps_args $docker_resource_args $(get_env_flags "$worker") $docker_args_common"
-        ssh "$worker" "$docker_run_cmd sleep infinity"
+        ssh "$worker" "$docker_run_cmd $keepalive_cmd"
     done
 
     # Apply mods (containers are idle — no mod_done sync needed)
     if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         echo "Applying modifications to cluster nodes..."
         for i in "${!MOD_PATHS[@]}"; do
-            apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+            if ! apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"; then
+                cleanup
+                return 1
+            fi
         done
         for worker in "${PEER_NODES[@]}"; do
             for i in "${!MOD_PATHS[@]}"; do
-                apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"
+                if ! apply_mod_to_container "$worker" "$CONTAINER_NAME" "false" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"; then
+                    cleanup
+                    return 1
+                fi
             done
         done
     fi
+    cleanup_generated_mods
 
     # Copy (and patch for no-ray) launch script
     if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
@@ -990,7 +1511,16 @@ start_cluster() {
                 (( rank++ ))
             done
         else
-            copy_script_to_container "$CONTAINER_NAME" "$LAUNCH_SCRIPT_PATH" "head node"
+            local ray_script="$LAUNCH_SCRIPT_PATH"
+            local temp_ray_script=""
+            if [[ "$SOLO_MODE" == "false" ]]; then
+                ray_script=$(make_ray_script "$LAUNCH_SCRIPT_PATH")
+                if [[ "$ray_script" != "$LAUNCH_SCRIPT_PATH" ]]; then
+                    temp_ray_script="$ray_script"
+                fi
+            fi
+            copy_script_to_container "$CONTAINER_NAME" "$ray_script" "head node"
+            [[ -n "$temp_ray_script" ]] && rm -f "$temp_ray_script"
         fi
     fi
 
@@ -1056,7 +1586,7 @@ exec_no_ray_cluster() {
             worker_cmd="$base_cmd"  # script already patched per-node in start_cluster()
         else
             local clean
-            clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
+            clean=$(echo "$base_cmd" | sed -E 's/--distributed-executor-backend(=|[[:space:]]+)[^[:space:]]+//g')
             worker_cmd="$clean --nnodes $total_nodes --node-rank $rank --master-addr $HEAD_IP --master-port $MASTER_PORT --headless"
         fi
         echo "Launching worker (rank $rank) on $worker..."
@@ -1073,7 +1603,7 @@ exec_no_ray_cluster() {
         head_cmd="$base_cmd"
     else
         local clean
-        clean=$(echo "$base_cmd" | sed 's/--distributed-executor-backend[[:space:]]*[^[:space:]]*//')
+        clean=$(echo "$base_cmd" | sed -E 's/--distributed-executor-backend(=|[[:space:]]+)[^[:space:]]+//g')
         head_cmd="$clean --nnodes $total_nodes --node-rank 0 --master-addr $HEAD_IP --master-port $MASTER_PORT"
     fi
 
@@ -1091,6 +1621,10 @@ exec_no_ray_cluster() {
         fi
     fi
 }
+
+if [[ "$ACTION" == "exec" && "$SOLO_MODE" == "false" && "$NO_RAY_MODE" == "false" && "$LAUNCH_SCRIPT_MODE" != "true" ]]; then
+    COMMAND_TO_RUN=$(ensure_ray_backend_command "$COMMAND_TO_RUN")
+fi
 
 if [[ "$ACTION" == "exec" ]]; then
     # Trim (or error on) PEER_NODES based on declared parallelism, for any multi-node exec
@@ -1116,7 +1650,7 @@ if [[ "$ACTION" == "exec" ]]; then
         fi
     fi
 
-    start_cluster
+    start_cluster || exit 1
     echo "Executing command: $COMMAND_TO_RUN"
 
     if [[ "$NO_RAY_MODE" == "true" && ${#PEER_NODES[@]} -gt 0 ]]; then
@@ -1129,7 +1663,7 @@ if [[ "$ACTION" == "exec" ]]; then
         _exec_on_head "$COMMAND_TO_RUN"
     fi
 elif [[ "$ACTION" == "start" ]]; then
-    start_cluster
+    start_cluster || exit 1
     if [[ "$DAEMON_MODE" == "true" ]]; then
         echo "Cluster started in background (Daemon mode)."
     else

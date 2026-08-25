@@ -7,25 +7,61 @@ START_TIME=$(date +%s)
 # Default values
 IMAGE_TAG="vllm-node"
 IMAGE_TAG_SET=false
+PREBUILT_RUNNER_IMAGE="eugr/spark-vllm:latest"
+PREBUILT_B12X_RUNNER_IMAGE="eugr/spark-vllm-b12x:latest"
+USE_WHEELS=false
 REBUILD_FLASHINFER=false
 REBUILD_VLLM=false
+FLASHINFER_ARCH_REBUILD=false
+FLASHINFER_ARCH_MISMATCH=false
+VLLM_ARCH_REBUILD=false
+VLLM_ARCH_MISMATCH=false
+FORCE_FLASHINFER_DOWNLOAD=false
+FORCE_VLLM_DOWNLOAD=false
 COPY_HOSTS=()
 COPY_TO_FLAG=false
 SSH_USER="$USER"
 NO_BUILD=false
+DEFAULT_VLLM_REPO="https://github.com/vllm-project/vllm.git"
+VLLM_REPO="$DEFAULT_VLLM_REPO"
+VLLM_REPO_SET=false
 VLLM_REF="main"
 VLLM_REF_SET=false
+EXP_B12X=false
+EXP_B12X_VLLM_REPO="https://github.com/local-inference-lab/vllm"
+EXP_B12X_VLLM_REF="dev/infernal-invocation"
+EXP_B12X_PACKAGE_REPO="https://github.com/lukealonso/b12x.git"
+EXP_B12X_PACKAGE_REF="master"
+EXP_B12X_TORCH_VERSION="2.13.0"
+EXP_B12X_TORCHVISION_VERSION="0.28.0"
+EXP_B12X_TORCHAUDIO_VERSION="2.11.0"
+B12X_REPO=""
+B12X_REF=""
+B12X_CACHEBUST=""
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
 TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
 VLLM_PRS=""
+APPLY_PRESET_VLLM_PRS=false
 FLASHINFER_PRS=""
+# Deprecated --tf5 aliases are kept for tag compatibility only; they no longer alter dependency resolution.
 PRE_TRANSFORMERS=false
 FULL_LOG=false
 BUILD_JOBS="16"
-GPU_ARCH_LIST="12.1a"
+BUILD_JOBS_SET=false
+DEFAULT_GPU_ARCH_LIST="12.1a"
+GPU_ARCH_LIST="$DEFAULT_GPU_ARCH_LIST"
+GPU_ARCH_SET=false
+DEFAULT_TORCH_VERSION="2.13.0"
+TORCH_VERSION="$DEFAULT_TORCH_VERSION"
+TORCH_VERSION_SET=false
+TORCHVISION_VERSION="0.28.0"
+TORCHVISION_VERSION_SET=false
+TORCHAUDIO_VERSION="2.11.0"
+TORCHAUDIO_VERSION_SET=false
+CUTLASS_DSL_VERSION="4.7.0"
 NETWORK_ARG=""
 WHEELS_REPO="eugr/spark-vllm-docker"
 FLASHINFER_RELEASE_TAG="prebuilt-flashinfer-current"
@@ -34,11 +70,24 @@ VLLM_RELEASE_TAG="prebuilt-vllm-current"
 PREBUILT_WHEELS_SUPPORTED_ARCHS="12.1a"
 CLEANUP_MODE="false"
 CONFIG_FILE=""
+WHEEL_CACHE_ROOT="./.wheel-cache"
+FLASHINFER_PROFILE="regular"
+VLLM_PROFILE="regular"
+FLASHINFER_WHEELS_DIR=""
+VLLM_WHEELS_DIR=""
+FLASHINFER_STAGING_DIR=""
+VLLM_STAGING_DIR=""
 
 cleanup() {
     if [ -n "$TMP_IMAGE" ] && [ -f "$TMP_IMAGE" ]; then
         echo "Cleaning up temporary image $TMP_IMAGE"
         rm -f "$TMP_IMAGE"
+    fi
+    if [ -n "$FLASHINFER_STAGING_DIR" ] && [ -d "$FLASHINFER_STAGING_DIR" ]; then
+        rm -rf "$FLASHINFER_STAGING_DIR"
+    fi
+    if [ -n "$VLLM_STAGING_DIR" ] && [ -d "$VLLM_STAGING_DIR" ]; then
+        rm -rf "$VLLM_STAGING_DIR"
     fi
     rm -f ./build-metadata.yaml
 }
@@ -51,9 +100,16 @@ generate_build_metadata() {
     local vllm_commit="$3"
     local flashinfer_commit="$4"
     local vllm_ref="$5"
-    local pre_transformers="$6"
+    local transformers_5="$6"
     local exp_mxfp4="$7"
     local vllm_prs="$8"
+    local vllm_repo="$9"
+    local torch_version="${10}"
+    local torchvision_version="${11}"
+    local torchaudio_version="${12}"
+    local b12x_repo="${13}"
+    local b12x_ref="${14}"
+    local cutlass_dsl_version="${15}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -67,8 +123,15 @@ flashinfer_commit: ${flashinfer_commit:-unknown}
 gpu_arch: ${GPU_ARCH_LIST}
 base_image: ${base_image:-unknown}
 build_args:
+  vllm_repo: "${vllm_repo}"
   vllm_ref: ${vllm_ref}
-  transformers_5: ${pre_transformers}
+  torch_version: "${torch_version}"
+  torchvision_version: "${torchvision_version}"
+  torchaudio_version: "${torchaudio_version}"
+  cutlass_dsl_version: "${cutlass_dsl_version}"
+  b12x_repo: "${b12x_repo}"
+  b12x_ref: "${b12x_ref}"
+  transformers_5: ${transformers_5}
   exp_mxfp4: ${exp_mxfp4}
   vllm_prs: "${vllm_prs}"
   build_jobs: ${BUILD_JOBS}
@@ -89,6 +152,21 @@ add_copy_hosts() {
     done
 }
 
+# Convert --gpu-arch value (e.g. 12.0, 12.0f, 12.1a) to NCCL NVCC_GENCODE format.
+gpu_arch_to_nccl_gencode() {
+    local arch="$1"
+    # Strip optional feature suffix (12.1a -> 12.1, 12.0f -> 12.0).
+    arch="${arch%[a-z]}"
+    local sm="${arch//./}"
+    echo "-gencode=arch=compute_${sm},code=sm_${sm}"
+}
+
+get_remote_image_id() {
+    local host="$1"
+    local image="$2"
+    ssh "${SSH_USER}@${host}" "docker image inspect --format '{{.Id}}' ${image}" 2>/dev/null
+}
+
 copy_to_host() {
     local host="$1"
     echo "Loading image into ${SSH_USER}@${host}..."
@@ -104,19 +182,86 @@ copy_to_host() {
     fi
 }
 
-# try_download_wheels TAG PREFIX
+get_local_mtime() {
+    local path="$1"
+    stat -c %Y "$path" 2>/dev/null || stat -f %m "$path"
+}
+
+get_remote_asset_mtime() {
+    local url="$1"
+    curl -fsIL --connect-timeout 10 "$url" | python3 -c '
+import email.utils
+import sys
+
+last_modified = None
+for line in sys.stdin:
+    if line.lower().startswith("last-modified:"):
+        last_modified = line.split(":", 1)[1].strip()
+
+if not last_modified:
+    sys.exit(1)
+
+try:
+    print(int(email.utils.parsedate_to_datetime(last_modified).timestamp()))
+except Exception:
+    sys.exit(1)
+'
+}
+
+local_wheels_are_newer_than_release() {
+    local wheels_dir="$1"
+    local prefix="$2"
+    local release_entries="$3"
+
+    local local_oldest_ts=""
+    local f local_ts
+    for f in "$wheels_dir/${prefix}"*.whl; do
+        [ -f "$f" ] || continue
+        local_ts=$(get_local_mtime "$f" 2>/dev/null || echo 0)
+        if [ -z "$local_oldest_ts" ] || [ "$local_ts" -lt "$local_oldest_ts" ]; then
+            local_oldest_ts="$local_ts"
+        fi
+    done
+
+    if [ -z "$local_oldest_ts" ] || [ "$local_oldest_ts" -eq 0 ]; then
+        return 1
+    fi
+
+    local remote_newest_ts=0
+    local url name remote_ts
+    while IFS=' ' read -r url name; do
+        [ -z "$url" ] && continue
+        remote_ts=$(get_remote_asset_mtime "$url" 2>/dev/null || true)
+        if [ -z "$remote_ts" ]; then
+            return 1
+        fi
+        if [ "$remote_ts" -gt "$remote_newest_ts" ]; then
+            remote_newest_ts="$remote_ts"
+        fi
+    done <<< "$release_entries"
+
+    if [ "$remote_newest_ts" -eq 0 ]; then
+        return 1
+    fi
+
+    [ "$local_oldest_ts" -ge "$remote_newest_ts" ]
+}
+
+# try_download_wheels TAG PREFIX FORCE_DOWNLOAD WHEELS_DIR
 # Downloads wheels matching PREFIX*.whl from a GitHub release.
-# Skip conditions (either is sufficient):
-#   1. Commit hash in release name matches .wheels/.{PREFIX}_commit (primary check).
-#   2. All local wheels are newer than the latest GitHub asset (freshly built).
-# Only downloads a file when the remote asset is newer than the local copy AND
-# the above skip conditions are not met.
-# On success, persists the release commit hash to .wheels/.{PREFIX}_commit.
+# Uses GitHub release pages and HTTP Last-Modified headers instead of GitHub API metadata.
+# Skips download when exact release assets are current, or when a newer locally
+# built wheel set is present even if its filenames differ from the release.
+# When FORCE_DOWNLOAD is true, downloads every matching release asset.
+# On success, persists the release commit hash to WHEELS_DIR/.{PREFIX}-commit.
 # Returns 0 if all matching wheels are now available, 1 on any error.
 try_download_wheels() {
     local TAG="$1"
     local PREFIX="$2"
-    local WHEELS_DIR="./wheels"
+    local FORCE_DOWNLOAD="${3:-false}"
+    local WHEELS_DIR="$4"
+
+    mkdir -p "$WHEELS_DIR"
 
     local arch
     for arch in $PREBUILT_WHEELS_SUPPORTED_ARCHS; do
@@ -128,97 +273,127 @@ try_download_wheels() {
         return 1
     fi
 
-    local RELEASE_JSON
-    RELEASE_JSON=$(curl -sf --connect-timeout 10 \
-        "https://api.github.com/repos/$WHEELS_REPO/releases/tags/$TAG") || {
-        echo "Could not fetch release metadata for '$TAG' — skipping download."
+    local RELEASE_ASSETS_HTML
+    RELEASE_ASSETS_HTML=$(curl -sfL --connect-timeout 10 \
+        "https://github.com/$WHEELS_REPO/releases/expanded_assets/$TAG") || {
+        echo "Could not fetch release assets for '$TAG' — skipping download."
         return 1
     }
 
-    local DOWNLOAD_LIST
-    DOWNLOAD_LIST=$(echo "$RELEASE_JSON" | python3 -c '
-import json, sys, os, re
-from datetime import datetime, timezone
+    local RELEASE_ENTRIES
+    RELEASE_ENTRIES=$(printf '%s' "$RELEASE_ASSETS_HTML" | python3 -c '
+import html.parser, os, sys
+from urllib.parse import unquote, urlparse
 
-wheels_dir, prefix = sys.argv[1], sys.argv[2]
-data = json.load(sys.stdin)
-assets = [a for a in data.get("assets", [])
-          if a["name"].startswith(prefix) and a["name"].endswith(".whl")]
+repo, tag, prefix = sys.argv[1], sys.argv[2], sys.argv[3]
+asset_path_prefix = "/" + repo + "/releases/download/" + tag + "/"
 
-if not assets:
+class ReleaseAssetParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        attrs = dict(attrs)
+        href = attrs.get("href")
+        if href:
+            self.hrefs.append(href)
+
+parser = ReleaseAssetParser()
+parser.feed(sys.stdin.read())
+
+seen = set()
+for href in parser.hrefs:
+    if not href.startswith(asset_path_prefix):
+        continue
+    name = unquote(os.path.basename(urlparse(href).path))
+    if not name.startswith(prefix) or not name.endswith(".whl"):
+        continue
+    if name in seen:
+        continue
+    seen.add(name)
+    print("https://github.com" + href + " " + name)
+
+if not seen:
     print("No assets found matching prefix: " + prefix, file=sys.stderr)
     sys.exit(1)
+' "$WHEELS_REPO" "$TAG" "$PREFIX") || return 1
 
-# Extract commit hash from the release name:
-#   FlashInfer: "Prebuilt FlashInfer Wheels (0.6.5-124a2d32-d20260305) - DGX Spark Only"
-#   vLLM:       "Prebuilt vLLM Wheels (0.16.1rc1.dev296+ga73af584f.d20260305.cu131) - DGX Spark only"
-release_name = data.get("name", "")
-commit_hash = None
+    local RELEASE_PAGE_HTML REMOTE_COMMIT
+    REMOTE_COMMIT=""
+    if RELEASE_PAGE_HTML=$(curl -sfL --connect-timeout 10 \
+        "https://github.com/$WHEELS_REPO/releases/tag/$TAG"); then
+        REMOTE_COMMIT=$(printf '%s' "$RELEASE_PAGE_HTML" | python3 -c '
+import re, sys
+
+prefix = sys.argv[1]
+html = sys.stdin.read()
+match = None
 if prefix.startswith("flashinfer"):
-    m = re.search(r"\([\d.]+\w*-([0-9a-f]{6,})-d\d{8}\)", release_name, re.IGNORECASE)
-    if m:
-        commit_hash = m.group(1)
+    match = re.search(r"\([\d.]+\w*-([0-9a-f]{6,})-d\d{8}\)", html, re.IGNORECASE)
 else:
-    m = re.search(r"\+g([0-9a-f]{6,})\.", release_name, re.IGNORECASE)
-    if m:
-        commit_hash = m.group(1)
-
-# Compare against the locally stored commit hash
-commit_file = os.path.join(wheels_dir, "." + prefix + "-commit")
-local_commit = None
-if os.path.exists(commit_file):
-    with open(commit_file) as f:
-        local_commit = f.read().strip()
-
-if commit_hash and local_commit and local_commit[:len(commit_hash)] == commit_hash:
-    print("Commit hash matches (" + commit_hash + ") — wheels are up to date.", file=sys.stderr)
-    sys.exit(0)
-
-newest_remote_ts = max(
-    datetime.strptime(a["updated_at"], "%Y-%m-%dT%H:%M:%SZ")
-            .replace(tzinfo=timezone.utc).timestamp()
-    for a in assets
-)
-
-# If local wheels (any version matching prefix) are all newer than the
-# latest GitHub asset, they were freshly built and should not be replaced.
-local_wheels = [
-    os.path.join(wheels_dir, f) for f in os.listdir(wheels_dir)
-    if f.startswith(prefix) and f.endswith(".whl")
-]
-if local_wheels and all(os.path.getmtime(p) >= newest_remote_ts for p in local_wheels):
-    sys.exit(0)
-
-downloads = []
-for a in assets:
-    local_path = os.path.join(wheels_dir, a["name"])
-    remote_ts = datetime.strptime(a["updated_at"], "%Y-%m-%dT%H:%M:%SZ") \
-                    .replace(tzinfo=timezone.utc).timestamp()
-    if not os.path.exists(local_path) or remote_ts > os.path.getmtime(local_path):
-        downloads.append(a["browser_download_url"] + " " + a["name"])
-
-if downloads:
-    if commit_hash:
-        print("#commit:" + commit_hash)
-    for d in downloads:
-        print(d)
-' "$WHEELS_DIR" "$PREFIX") || return 1
-
-    if [ -z "$DOWNLOAD_LIST" ]; then
-        echo "All $PREFIX wheels are up to date — skipping download."
-        return 0
+    match = re.search(r"\+g([0-9a-f]{6,})\.", html, re.IGNORECASE)
+if match:
+    print(match.group(1))
+' "$PREFIX")
     fi
 
-    # Parse the optional '#commit:HASH' sentinel emitted by the Python script
-    local REMOTE_COMMIT=""
     local DOWNLOAD_ENTRIES=""
-    while IFS= read -r LINE; do
-        if [[ "$LINE" == "#commit:"* ]]; then
-            REMOTE_COMMIT="${LINE#"#commit:"}"
-        elif [[ -n "$LINE" ]]; then
-            DOWNLOAD_ENTRIES+="$LINE"$'\n'
+    if [ "$FORCE_DOWNLOAD" = true ]; then
+        echo "Force downloading $PREFIX wheels from release '$TAG'..."
+        DOWNLOAD_ENTRIES="$RELEASE_ENTRIES"
+    else
+        local LOCAL_COMMIT=""
+        if [ -f "$WHEELS_DIR/.${PREFIX}-commit" ]; then
+            LOCAL_COMMIT=$(cat "$WHEELS_DIR/.${PREFIX}-commit")
         fi
-    done <<< "$DOWNLOAD_LIST"
+
+        local NEED_DOWNLOAD=false
+        local RELEASE_ASSETS_PRESENT=true
+        local URL NAME
+        while IFS=' ' read -r URL NAME; do
+            [ -z "$URL" ] && continue
+            if [ ! -f "$WHEELS_DIR/$NAME" ]; then
+                RELEASE_ASSETS_PRESENT=false
+                break
+            fi
+        done <<< "$RELEASE_ENTRIES"
+
+        if [ "$RELEASE_ASSETS_PRESENT" = false ]; then
+            if local_wheels_are_newer_than_release "$WHEELS_DIR" "$PREFIX" "$RELEASE_ENTRIES"; then
+                echo "Local $PREFIX wheels are newer than release '$TAG' — skipping download."
+                return 0
+            fi
+            NEED_DOWNLOAD=true
+        fi
+
+        if [ "$NEED_DOWNLOAD" = false ]; then
+            if [ -n "$REMOTE_COMMIT" ] && [ -n "$LOCAL_COMMIT" ] && [[ "$LOCAL_COMMIT" == "$REMOTE_COMMIT"* ]]; then
+                echo "Commit hash matches ($REMOTE_COMMIT) — wheels are up to date."
+                return 0
+            fi
+        fi
+
+        while [ "$NEED_DOWNLOAD" = false ] && IFS=' ' read -r URL NAME; do
+            [ -z "$URL" ] && continue
+            local LOCAL_TS REMOTE_TS
+            LOCAL_TS=$(get_local_mtime "$WHEELS_DIR/$NAME" 2>/dev/null || echo 0)
+            REMOTE_TS=$(get_remote_asset_mtime "$URL" 2>/dev/null || true)
+            if [ -z "$REMOTE_TS" ] || [ "$REMOTE_TS" -gt "$LOCAL_TS" ]; then
+                NEED_DOWNLOAD=true
+                break
+            fi
+        done <<< "$RELEASE_ENTRIES"
+
+        if [ "$NEED_DOWNLOAD" = false ]; then
+            echo "All $PREFIX wheels are up to date — skipping download."
+            return 0
+        fi
+
+        DOWNLOAD_ENTRIES="$RELEASE_ENTRIES"
+    fi
 
     if [ -z "$DOWNLOAD_ENTRIES" ]; then
         echo "All $PREFIX wheels are up to date — skipping download."
@@ -251,6 +426,8 @@ if downloads:
             if compgen -G "$DL_BACKUP/${PREFIX}*.whl" > /dev/null 2>&1; then
                 echo "Restoring previous $PREFIX wheels..."
                 mv "$DL_BACKUP/${PREFIX}"*.whl "$WHEELS_DIR/"
+            fi
+            if compgen -G "$DL_BACKUP/.${PREFIX}*" > /dev/null 2>&1; then
                 mv "$DL_BACKUP/.${PREFIX}"* "$WHEELS_DIR/"
             fi
             rm -rf "$DL_BACKUP"
@@ -266,28 +443,108 @@ if downloads:
     return 0
 }
 
+validate_exported_wheel_set() {
+    local component="$1"
+    local wheels_dir="$2"
+
+    if [ "$component" = "flashinfer" ]; then
+        local cubin=("$wheels_dir"/flashinfer_cubin-*.whl)
+        local jit=("$wheels_dir"/flashinfer_jit_cache-*.whl)
+        local python=("$wheels_dir"/flashinfer_python-*.whl)
+        if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ] || \
+           [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
+           [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ] || \
+           [ ! -s "$wheels_dir/.flashinfer-commit" ] || \
+           [ ! -s "$wheels_dir/.flashinfer-arch" ]; then
+            echo "Error: FlashInfer export did not produce one complete wheel set with provenance markers."
+            return 1
+        fi
+    else
+        local vllm=("$wheels_dir"/vllm-*.whl)
+        if [ "${#vllm[@]}" -ne 1 ] || [ ! -f "${vllm[0]}" ] || \
+           [ ! -s "$wheels_dir/.vllm-commit" ] || \
+           [ ! -s "$wheels_dir/.deepgemm-commit" ] || \
+           [ ! -s "$wheels_dir/.vllm-arch" ]; then
+            echo "Error: vLLM export did not produce exactly one wheel with provenance markers."
+            return 1
+        fi
+    fi
+}
+
+validate_runner_wheel_inputs() {
+    local flashinfer_dir="$1"
+    local vllm_dir="$2"
+    local cubin=("$flashinfer_dir"/flashinfer_cubin-*.whl)
+    local jit=("$flashinfer_dir"/flashinfer_jit_cache-*.whl)
+    local python=("$flashinfer_dir"/flashinfer_python-*.whl)
+    local vllm=("$vllm_dir"/vllm-*.whl)
+
+    if [ "${#cubin[@]}" -ne 1 ] || [ ! -f "${cubin[0]}" ] || \
+       [ "${#jit[@]}" -ne 1 ] || [ ! -f "${jit[0]}" ] || \
+       [ "${#python[@]}" -ne 1 ] || [ ! -f "${python[0]}" ]; then
+        echo "Error: FlashInfer profile $flashinfer_dir does not contain exactly one complete wheel set."
+        return 1
+    fi
+    if [ "${#vllm[@]}" -ne 1 ] || [ ! -f "${vllm[0]}" ]; then
+        echo "Error: vLLM profile $vllm_dir does not contain exactly one wheel."
+        return 1
+    fi
+}
+
+promote_wheel_set() {
+    local staging_dir="$1"
+    local target_dir="$2"
+    local backup_dir="${target_dir}.backup.$$"
+
+    rm -rf "$backup_dir"
+    if [ -d "$target_dir" ]; then
+        mv "$target_dir" "$backup_dir"
+    fi
+
+    if mv "$staging_dir" "$target_dir"; then
+        rm -rf "$backup_dir"
+        return 0
+    fi
+
+    echo "Error: Could not promote wheel set into $target_dir."
+    if [ -d "$backup_dir" ]; then
+        mv "$backup_dir" "$target_dir"
+    fi
+    return 1
+}
+
 # Help function
 usage() {
     echo "Usage: $0 [OPTIONS]"
-    echo "  -t, --tag <tag>               : Image tag (default: 'vllm-node', 'vllm-node-tf5' with --tf5, 'vllm-node-mxfp4' with --exp-mxfp4)"
-    echo "  --gpu-arch <arch>             : GPU architecture (default: '12.1a')"
+    echo "  -t, --tag <tag>               : Local image tag (default: 'vllm-node'; preset tags: 'vllm-node-tf5', 'vllm-node-mxfp4', or 'vllm-node-b12x')"
+    echo "  --use-wheels                  : Build only the runner from precompiled wheels; never implicitly build source."
+    echo "  --gpu-arch <arch>             : GPU architecture for NCCL, wheel, and source builds (default: '${DEFAULT_GPU_ARCH_LIST}')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
+    echo "  --force-flashinfer-download   : Force download of FlashInfer wheels (skip cached wheel checks)"
+    echo "  --force-vllm-download         : Force download of vLLM wheels (skip cached wheel checks)"
+    echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
+    echo "  --vllm-repo <url>             : vLLM Git repository (default: '${DEFAULT_VLLM_REPO}'); custom repositories bypass the shared checkout cache"
     echo "  --vllm-ref <ref>              : vLLM commit SHA, branch or tag (default: 'main')"
+    echo "  --torch-version <version>     : PyTorch version for build and runner images (default: '${DEFAULT_TORCH_VERSION}')"
+    echo "  --torchvision-version <ver>   : Optional torchvision version (default: '${TORCHVISION_VERSION}')"
+    echo "  --torchaudio-version <ver>    : Optional torchaudio version; use 'none' to omit it (default: '${TORCHAUDIO_VERSION}')"
     echo "  --flashinfer-ref <ref>        : FlashInfer commit SHA, branch or tag (default: 'main')"
-    echo "  -c, --copy-to <hosts>         : Host(s) to copy the image to. Accepts comma or space-delimited lists."
+    echo "  -c, --copy-to [hosts]         : Copy the image. Omit hosts to use COPY_HOSTS from .env or autodiscovery; matching image IDs are skipped."
     echo "      --copy-to-host            : Alias for --copy-to (backwards compatibility)."
-    echo "      --copy-parallel           : Copy to all hosts in parallel instead of serially."
+    echo "      --copy-parallel           : With -c, copy to all resolved hosts concurrently."
     echo "  -j, --build-jobs <jobs>       : Number of concurrent build jobs (default: ${BUILD_JOBS})"
     echo "  -u, --user <user>             : Username for ssh command (default: \$USER)"
-    echo "  --tf5                         : Install transformers>=5 (aliases: --pre-tf, --pre-transformers)"
+    echo "  --tf5                         : Deprecated compatibility flag; tag defaults to 'vllm-node-tf5' (aliases: --pre-tf, --pre-transformers)"
     echo "  --exp-mxfp4, --experimental-mxfp4 : Build with experimental native MXFP4 support"
+    echo "  --exp-b12x, --experimental-b12x   : Select B12X; pulls its prebuilt image unless a local wheel/image build is requested"
     echo "  --apply-vllm-pr <pr-num>      : Apply a specific PR patch to vLLM source. Can be specified multiple times."
+    echo "  --apply-preset-vllm-prs       : Apply preset vLLM PRs even with --vllm-repo, --vllm-ref, or --apply-vllm-pr."
     echo "  --apply-flashinfer-pr <pr-num>: Apply a specific PR patch to FlashInfer source. Can be specified multiple times."
     echo "  --full-log                    : Enable full build logging (--progress=plain)"
     echo "  --no-build                    : Skip building, only copy image (requires --copy-to)"
     echo "  --network <network>           : Docker network to use during build"
-    echo "  --cleanup                     : Remove all *.whl and *.-commit files in wheels directory"
+    echo "  --cleanup                     : Remove wheel files and provenance markers from all cache profiles"
     echo "  --config                      : Path to .env configuration file (default: .env in script directory)"
     echo "  --setup                       : Force autodiscovery and save configuration (even if .env exists)"
     echo "  -h, --help                    : Show this help message"
@@ -299,10 +556,57 @@ CONFIG_FILE_SET=false
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         -t|--tag) IMAGE_TAG="$2"; IMAGE_TAG_SET=true; shift ;;
-        --gpu-arch) GPU_ARCH_LIST="$2"; shift ;;
+        --use-wheels) USE_WHEELS=true ;;
+        --gpu-arch) GPU_ARCH_LIST="$2"; GPU_ARCH_SET=true; shift ;;
         --rebuild-flashinfer) REBUILD_FLASHINFER=true ;;
         --rebuild-vllm) REBUILD_VLLM=true ;;
+        --force-flashinfer-download) FORCE_FLASHINFER_DOWNLOAD=true ;;
+        --force-vllm-download) FORCE_VLLM_DOWNLOAD=true ;;
+        --force-download)
+            FORCE_FLASHINFER_DOWNLOAD=true
+            FORCE_VLLM_DOWNLOAD=true
+            ;;
+        --vllm-repo)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+                VLLM_REPO="$2"
+                VLLM_REPO_SET=true
+                shift
+            else
+                echo "Error: --vllm-repo requires a repository URL."
+                exit 1
+            fi
+            ;;
         --vllm-ref) VLLM_REF="$2"; VLLM_REF_SET=true; shift ;;
+        --torch-version)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+                TORCH_VERSION="$2"
+                TORCH_VERSION_SET=true
+                shift
+            else
+                echo "Error: --torch-version requires a version."
+                exit 1
+            fi
+            ;;
+        --torchvision-version)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+                TORCHVISION_VERSION="$2"
+                TORCHVISION_VERSION_SET=true
+                shift
+            else
+                echo "Error: --torchvision-version requires a version."
+                exit 1
+            fi
+            ;;
+        --torchaudio-version)
+            if [ -n "$2" ] && [[ "$2" != -* ]]; then
+                TORCHAUDIO_VERSION="$2"
+                TORCHAUDIO_VERSION_SET=true
+                shift
+            else
+                echo "Error: --torchaudio-version requires a version."
+                exit 1
+            fi
+            ;;
         --flashinfer-ref) FLASHINFER_REF="$2"; FLASHINFER_REF_SET=true; shift ;;
         -c|--copy-to|--copy-to-host|--copy-to-hosts)
             COPY_TO_FLAG=true
@@ -313,11 +617,12 @@ while [[ "$#" -gt 0 ]]; do
             done
             continue
             ;;
-        -j|--build-jobs) BUILD_JOBS="$2"; shift ;;
+        -j|--build-jobs) BUILD_JOBS="$2"; BUILD_JOBS_SET=true; shift ;;
         -u|--user) SSH_USER="$2"; shift ;;
         --copy-parallel) PARALLEL_COPY=true ;;
         --tf5|--pre-tf|--pre-transformers) PRE_TRANSFORMERS=true ;;
         --exp-mxfp4|--experimental-mxfp4) EXP_MXFP4=true ;;
+        --exp-b12x|--experimental-b12x) EXP_B12X=true ;;
         --apply-vllm-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                if [ -n "$VLLM_PRS" ]; then
@@ -331,6 +636,7 @@ while [[ "$#" -gt 0 ]]; do
                exit 1
             fi
             ;;
+        --apply-preset-vllm-prs) APPLY_PRESET_VLLM_PRS=true ;;
         --apply-flashinfer-pr)
             if [ -n "$2" ] && [[ "$2" != -* ]]; then
                if [ -n "$FLASHINFER_PRS" ]; then
@@ -364,13 +670,60 @@ while [[ "$#" -gt 0 ]]; do
     shift
 done
 
+# The B12X preset uses the standard Dockerfile and source-build path, but owns
+# the fork/ref and Torch-family versions needed by that integration.
+if [ "$EXP_B12X" = true ]; then
+    if [ "$EXP_MXFP4" = true ]; then echo "Error: --exp-b12x is incompatible with --exp-mxfp4"; exit 1; fi
+    if [ "$USE_WHEELS" = true ]; then echo "Error: --exp-b12x is incompatible with --use-wheels because B12X vLLM wheels are not published"; exit 1; fi
+    if [ "$VLLM_REPO_SET" = true ]; then echo "Error: --exp-b12x is incompatible with --vllm-repo"; exit 1; fi
+    if [ "$VLLM_REF_SET" = true ]; then echo "Error: --exp-b12x is incompatible with --vllm-ref"; exit 1; fi
+    if [ "$TORCH_VERSION_SET" = true ]; then echo "Error: --exp-b12x is incompatible with --torch-version"; exit 1; fi
+    if [ "$TORCHVISION_VERSION_SET" = true ]; then echo "Error: --exp-b12x is incompatible with --torchvision-version"; exit 1; fi
+    if [ "$TORCHAUDIO_VERSION_SET" = true ]; then echo "Error: --exp-b12x is incompatible with --torchaudio-version"; exit 1; fi
+    if [ "$PRE_TRANSFORMERS" = true ]; then echo "Error: --exp-b12x is incompatible with --tf5"; exit 1; fi
+    if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then echo "Error: --exp-b12x is incompatible with --apply-preset-vllm-prs"; exit 1; fi
+
+    VLLM_REPO="$EXP_B12X_VLLM_REPO"
+    VLLM_REF="$EXP_B12X_VLLM_REF"
+    TORCH_VERSION="$EXP_B12X_TORCH_VERSION"
+    TORCHVISION_VERSION="$EXP_B12X_TORCHVISION_VERSION"
+    TORCHAUDIO_VERSION="$EXP_B12X_TORCHAUDIO_VERSION"
+    PREBUILT_RUNNER_IMAGE="$PREBUILT_B12X_RUNNER_IMAGE"
+fi
+
 # Apply default IMAGE_TAG based on flags if -t was not specified
 if [ "$IMAGE_TAG_SET" = false ]; then
     if [ "$PRE_TRANSFORMERS" = true ]; then
         IMAGE_TAG="vllm-node-tf5"
     elif [ "$EXP_MXFP4" = true ]; then
         IMAGE_TAG="vllm-node-mxfp4"
+    elif [ "$EXP_B12X" = true ]; then
+        IMAGE_TAG="vllm-node-b12x"
     fi
+fi
+
+if [ "$PRE_TRANSFORMERS" = true ]; then
+    echo "Warning: --tf5/--pre-tf/--pre-transformers is deprecated; vLLM now uses Transformers v5 by default."
+    echo "         No Transformers override will be applied; image tag remains $IMAGE_TAG."
+fi
+
+CUSTOM_VLLM_REPO=false
+if [ "$VLLM_REPO" != "$DEFAULT_VLLM_REPO" ]; then
+    CUSTOM_VLLM_REPO=true
+fi
+
+NORMALIZED_VLLM_REPO="${VLLM_REPO%/}"
+NORMALIZED_VLLM_REPO="${NORMALIZED_VLLM_REPO%.git}"
+if [ "$NORMALIZED_VLLM_REPO" = "$EXP_B12X_VLLM_REPO" ]; then
+    B12X_REPO="$EXP_B12X_PACKAGE_REPO"
+    B12X_REF="$EXP_B12X_PACKAGE_REF"
+    B12X_CACHEBUST="$(date +%s)"
+    TORCH_BASE_VERSION="${TORCH_VERSION%%+*}"
+    if [ "$(printf '%s\n' "2.12.0" "$TORCH_BASE_VERSION" | sort -V | head -n1)" != "2.12.0" ]; then
+        echo "Error: ${EXP_B12X_VLLM_REPO} requires --torch-version 2.12.0 or newer for B12X (got ${TORCH_VERSION})."
+        exit 1
+    fi
+    echo "Building B12X from ${B12X_REPO} ref ${B12X_REF} for ${NORMALIZED_VLLM_REPO} ref ${VLLM_REF}."
 fi
 
 # Source autodiscover.sh to load .env file
@@ -423,11 +776,66 @@ if [ -n "$FLASHINFER_PRS" ]; then
 fi
 
 if [ "$EXP_MXFP4" = true ]; then
+    if [ "$VLLM_REPO_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --vllm-repo"; exit 1; fi
     if [ "$VLLM_REF_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --vllm-ref"; exit 1; fi
+    if [ "$TORCH_VERSION_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --torch-version"; exit 1; fi
+    if [ "$TORCHVISION_VERSION_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --torchvision-version"; exit 1; fi
+    if [ "$TORCHAUDIO_VERSION_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --torchaudio-version"; exit 1; fi
     if [ "$FLASHINFER_REF_SET" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --flashinfer-ref"; exit 1; fi
     if [ "$PRE_TRANSFORMERS" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --tf5"; exit 1; fi
     if [ "$REBUILD_FLASHINFER" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-flashinfer"; exit 1; fi
     if [ "$REBUILD_VLLM" = true ]; then echo "Error: --exp-mxfp4 is incompatible with --rebuild-vllm"; exit 1; fi
+fi
+
+if [ "$EXP_B12X" = true ] && [ "$FORCE_VLLM_DOWNLOAD" = true ]; then
+    echo "Error: B12X vLLM wheels are not published; --force-vllm-download cannot be used with --exp-b12x."
+    echo "       Use --rebuild-vllm or provide a cached B12X wheel."
+    exit 1
+fi
+
+# Resolve wheel profiles independently from whether this invocation pulls a
+# prebuilt image or performs a local build. Regular FlashInfer wheels are shared
+# by the regular and B12X runners. Custom source/ref/architecture builds are
+# isolated so they cannot replace the tested shared wheel set.
+if [ "$FLASHINFER_REF_SET" = true ] || [ -n "$FLASHINFER_PRS" ] || \
+   { [ "$GPU_ARCH_SET" = true ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; }; then
+    FLASHINFER_PROFILE="custom"
+fi
+
+if [ "$EXP_B12X" = true ]; then
+    VLLM_PROFILE="b12x"
+elif [ "$CUSTOM_VLLM_REPO" = true ] || [ "$VLLM_REF_SET" = true ] || \
+     [ -n "$VLLM_PRS" ] || \
+     [ "$TORCH_VERSION" != "$DEFAULT_TORCH_VERSION" ] || \
+     [ "$TORCHVISION_VERSION_SET" = true ] || \
+     [ "$TORCHAUDIO_VERSION_SET" = true ] || \
+     { [ "$GPU_ARCH_SET" = true ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; }; then
+    VLLM_PROFILE="custom"
+fi
+
+FLASHINFER_WHEELS_DIR="$WHEEL_CACHE_ROOT/flashinfer/$FLASHINFER_PROFILE"
+VLLM_WHEELS_DIR="$WHEEL_CACHE_ROOT/vllm/$VLLM_PROFILE"
+
+# FlashInfer wheels are architecture-specific for every build flavor. Trust a
+# cache only when its marker matches the selected target. An absent marker
+# remains compatible with the historical default-architecture cache, but is
+# unsafe for alternate targets.
+CACHED_FLASHINFER_ARCH=""
+if [ -f "$FLASHINFER_WHEELS_DIR/.flashinfer-arch" ]; then
+    CACHED_FLASHINFER_ARCH=$(cat "$FLASHINFER_WHEELS_DIR/.flashinfer-arch")
+fi
+if { [ -n "$CACHED_FLASHINFER_ARCH" ] && [ "$CACHED_FLASHINFER_ARCH" != "$GPU_ARCH_LIST" ]; } || \
+   { [ -z "$CACHED_FLASHINFER_ARCH" ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; }; then
+    FLASHINFER_ARCH_MISMATCH=true
+fi
+
+CACHED_VLLM_ARCH=""
+if [ -f "$VLLM_WHEELS_DIR/.vllm-arch" ]; then
+    CACHED_VLLM_ARCH=$(cat "$VLLM_WHEELS_DIR/.vllm-arch")
+fi
+if { [ -n "$CACHED_VLLM_ARCH" ] && [ "$CACHED_VLLM_ARCH" != "$GPU_ARCH_LIST" ]; } || \
+   { [ -z "$CACHED_VLLM_ARCH" ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; }; then
+    VLLM_ARCH_MISMATCH=true
 fi
 
 # Validate --no-build usage
@@ -436,32 +844,90 @@ if [ "$NO_BUILD" = true ] && [ "${#COPY_HOSTS[@]}" -eq 0 ]; then
     exit 1
 fi
 
+# Select image preparation path. By default, use the tested nightly runner image.
+# Flags that materially change image contents keep the existing local build path.
+VLLM_PR_APPLICATION_REQUESTED=false
+if [ -n "$VLLM_PRS" ] || [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+    VLLM_PR_APPLICATION_REQUESTED=true
+    REBUILD_VLLM=true
+fi
+
+CUSTOM_BUILD_REQUESTED=false
+if [ "$EXP_MXFP4" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$GPU_ARCH_SET" = true ] && [ "$GPU_ARCH_LIST" != "$DEFAULT_GPU_ARCH_LIST" ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$VLLM_PROFILE" = "custom" ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$VLLM_REF_SET" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$TORCH_VERSION" != "$DEFAULT_TORCH_VERSION" ] && [ "$EXP_B12X" != true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$TORCHVISION_VERSION_SET" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$TORCHAUDIO_VERSION_SET" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$FLASHINFER_REF_SET" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$REBUILD_FLASHINFER" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$REBUILD_VLLM" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$FORCE_FLASHINFER_DOWNLOAD" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$FORCE_VLLM_DOWNLOAD" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ -n "$VLLM_PRS" ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then CUSTOM_BUILD_REQUESTED=true; fi
+if [ -n "$FLASHINFER_PRS" ]; then CUSTOM_BUILD_REQUESTED=true; fi
+
+# Only local wheel/image builds consume the wheel cache. A normal default invocation
+# still pulls the prebuilt runner even if the local wheel cache targets another
+# architecture. --use-wheels never compiles implicitly, so reject an unsafe
+# cache unless the caller also explicitly requested a FlashInfer rebuild.
+if [ "$FLASHINFER_ARCH_MISMATCH" = true ] && \
+   { [ "$CUSTOM_BUILD_REQUESTED" = true ] || [ "$USE_WHEELS" = true ]; }; then
+    if [ "$USE_WHEELS" = true ] && [ "$REBUILD_FLASHINFER" != true ]; then
+        echo "Error: Cached FlashInfer wheels do not match GPU architecture $GPU_ARCH_LIST."
+        echo "       Re-run with --rebuild-flashinfer or provide matching wheels with a .flashinfer-arch marker."
+        exit 1
+    fi
+    REBUILD_FLASHINFER=true
+    FLASHINFER_ARCH_REBUILD=true
+    CUSTOM_BUILD_REQUESTED=true
+fi
+
+if [ "$VLLM_ARCH_MISMATCH" = true ] && \
+   { [ "$CUSTOM_BUILD_REQUESTED" = true ] || [ "$USE_WHEELS" = true ]; }; then
+    if [ "$USE_WHEELS" = true ] && [ "$REBUILD_VLLM" != true ]; then
+        echo "Error: Cached $VLLM_PROFILE vLLM wheel does not match GPU architecture $GPU_ARCH_LIST."
+        echo "       Re-run with --rebuild-vllm or provide a matching wheel with a .vllm-arch marker."
+        exit 1
+    fi
+    REBUILD_VLLM=true
+    VLLM_ARCH_REBUILD=true
+    CUSTOM_BUILD_REQUESTED=true
+fi
+
+USE_PREBUILT_IMAGE=false
+if [ "$NO_BUILD" = false ] && [ "$USE_WHEELS" = false ] && [ "$CUSTOM_BUILD_REQUESTED" = false ]; then
+    USE_PREBUILT_IMAGE=true
+fi
+
 # Handle cleanup mode
 if [[ "$CLEANUP_MODE" == "true" ]]; then
-    WHEELS_DIR="./wheels"
-    echo "Cleaning up wheels directory..."
-    
-    # Remove all .whl files
-    if compgen -G "$WHEELS_DIR/*.whl" > /dev/null 2>&1; then
-        rm -f "$WHEELS_DIR"/*.whl
-        echo "Removed *.whl files from $WHEELS_DIR"
-    else
-        echo "No *.whl files found in $WHEELS_DIR"
-    fi
-    
-    # Remove all .-commit files
-    if compgen -G "$WHEELS_DIR/.*-commit" > /dev/null 2>&1; then
-        rm -f "$WHEELS_DIR"/.*-commit
-        echo "Removed .*-commit files from $WHEELS_DIR"
-    else
-        echo "No .*-commit files found in $WHEELS_DIR"
-    fi
-    
+    echo "Cleaning up wheel cache profiles..."
+    CACHE_DIRS=(
+        "$WHEEL_CACHE_ROOT/flashinfer/regular"
+        "$WHEEL_CACHE_ROOT/flashinfer/custom"
+        "$WHEEL_CACHE_ROOT/vllm/regular"
+        "$WHEEL_CACHE_ROOT/vllm/b12x"
+        "$WHEEL_CACHE_ROOT/vllm/custom"
+    )
+    for cache_dir in "${CACHE_DIRS[@]}"; do
+        [ -d "$cache_dir" ] || continue
+        rm -f "$cache_dir"/*.whl \
+            "$cache_dir"/.*-commit \
+            "$cache_dir"/.*-arch
+        echo "Cleaned $cache_dir"
+    done
     echo "Cleanup complete."
 fi
 
-# Ensure wheels directory exists
-mkdir -p ./wheels
+# Ensure the selected named-context directories exist for local builds.
+if [ "$NO_BUILD" = false ] && [ "$USE_PREBUILT_IMAGE" != true ]; then
+    mkdir -p "$FLASHINFER_WHEELS_DIR" "$VLLM_WHEELS_DIR"
+    echo "Using FlashInfer wheel profile: $FLASHINFER_PROFILE ($FLASHINFER_WHEELS_DIR)"
+    echo "Using vLLM wheel profile: $VLLM_PROFILE ($VLLM_WHEELS_DIR)"
+fi
 
 # Common build flags used across all non-mxfp4 sub-builds
 COMMON_BUILD_FLAGS=()
@@ -471,6 +937,14 @@ fi
 COMMON_BUILD_FLAGS+=("--build-arg" "BUILD_JOBS=$BUILD_JOBS")
 COMMON_BUILD_FLAGS+=("--build-arg" "TORCH_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
 COMMON_BUILD_FLAGS+=("--build-arg" "FLASHINFER_CUDA_ARCH_LIST=$GPU_ARCH_LIST")
+if [ "$EXP_MXFP4" = false ]; then
+    COMMON_BUILD_FLAGS+=("--build-arg" "TORCH_VERSION=$TORCH_VERSION")
+    COMMON_BUILD_FLAGS+=("--build-arg" "TORCHVISION_VERSION=$TORCHVISION_VERSION")
+    COMMON_BUILD_FLAGS+=("--build-arg" "TORCHAUDIO_VERSION=$TORCHAUDIO_VERSION")
+    COMMON_BUILD_FLAGS+=("--build-arg" "CUTLASS_DSL_VERSION=$CUTLASS_DSL_VERSION")
+fi
+NCCL_NVCC_GENCODE="$(gpu_arch_to_nccl_gencode "$GPU_ARCH_LIST")"
+COMMON_BUILD_FLAGS+=("--build-arg" "NCCL_NVCC_GENCODE=$NCCL_NVCC_GENCODE")
 if [ -n "$NETWORK_ARG" ]; then
     COMMON_BUILD_FLAGS+=("--network" "$NETWORK_ARG")
 fi
@@ -481,21 +955,43 @@ COMMON_BUILD_FLAGS+=("--build-arg" "http_proxy=$PROXY_URL")
 COMMON_BUILD_FLAGS+=("--build-arg" "https_proxy=$PROXY_URL")
 
 # =====================================================
-# Build image (unless --no-build or --exp-mxfp4)
+# Prepare image (unless --no-build)
 # =====================================================
 FLASHINFER_BUILD_TIME=0
 VLLM_BUILD_TIME=0
 RUNNER_BUILD_TIME=0
+PREBUILT_PULL_TIME=0
 
 if [ "$NO_BUILD" = false ]; then
-    if [ "$EXP_MXFP4" = true ]; then
+    if [ "$USE_PREBUILT_IMAGE" = true ]; then
+        echo "Using prebuilt runner image ${PREBUILT_RUNNER_IMAGE}..."
+        if [ -n "$NETWORK_ARG" ]; then
+            echo "Warning: --network is only used for Docker builds; ignoring it while pulling ${PREBUILT_RUNNER_IMAGE}."
+        fi
+        if [ "$FULL_LOG" = true ]; then
+            echo "Warning: --full-log is only used for Docker builds; ignoring it while pulling ${PREBUILT_RUNNER_IMAGE}."
+        fi
+        if [ "$BUILD_JOBS_SET" = true ]; then
+            echo "Warning: --build-jobs is only used for Docker builds; ignoring it while pulling ${PREBUILT_RUNNER_IMAGE}."
+        fi
+
+        PULL_START=$(date +%s)
+        docker pull "$PREBUILT_RUNNER_IMAGE"
+        if [ "$IMAGE_TAG" != "$PREBUILT_RUNNER_IMAGE" ]; then
+            docker tag "$PREBUILT_RUNNER_IMAGE" "$IMAGE_TAG"
+        fi
+        PULL_END=$(date +%s)
+        PREBUILT_PULL_TIME=$((PULL_END - PULL_START))
+    elif [ "$EXP_MXFP4" = true ]; then
         echo "Building with experimental MXFP4 support..."
 
         # Generate build metadata YAML for mxfp4 build
         MXFP4_VLLM_SHA=$(grep -m1 '^ARG VLLM_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
+        MXFP4_VLLM_REPO=$(grep -m1 '^ARG VLLM_REPO=' Dockerfile.mxfp4 | cut -d= -f2-)
         MXFP4_FLASHINFER_SHA=$(grep -m1 '^ARG FLASHINFER_SHA=' Dockerfile.mxfp4 | cut -d= -f2)
         generate_build_metadata Dockerfile.mxfp4 "unknown" "$MXFP4_VLLM_SHA" "$MXFP4_FLASHINFER_SHA" \
-            "mxfp4-pinned" "false" "true" ""
+            "mxfp4-pinned" "false" "true" "" "$MXFP4_VLLM_REPO" "base-image" \
+            "base-image" "base-image" "disabled" "disabled" "base-image"
 
         CMD=("docker" "build" "-t" "$IMAGE_TAG" "${COMMON_BUILD_FLAGS[@]}" "-f" "Dockerfile.mxfp4" ".")
         echo "Building image with command: ${CMD[*]}"
@@ -519,30 +1015,29 @@ if [ "$NO_BUILD" = false ]; then
                 echo "Rebuilding FlashInfer wheels (--flashinfer-ref specified)..."
             elif [ -n "$FLASHINFER_PRS" ]; then
                 echo "Rebuilding FlashInfer wheels (--apply-flashinfer-pr specified)..."
+            elif [ "$FLASHINFER_ARCH_REBUILD" = true ]; then
+                echo "Rebuilding FlashInfer wheels for GPU architecture $GPU_ARCH_LIST..."
             else
                 echo "Rebuilding FlashInfer wheels (--rebuild-flashinfer specified)..."
             fi
             BUILD_FLASHINFER=true
-        elif try_download_wheels "$FLASHINFER_RELEASE_TAG" "flashinfer"; then
+        elif try_download_wheels "$FLASHINFER_RELEASE_TAG" "flashinfer" "$FORCE_FLASHINFER_DOWNLOAD" "$FLASHINFER_WHEELS_DIR"; then
+            printf '%s\n' "$GPU_ARCH_LIST" > "$FLASHINFER_WHEELS_DIR/.flashinfer-arch"
             echo "FlashInfer wheels ready."
-        elif compgen -G "./wheels/flashinfer*.whl" > /dev/null 2>&1; then
+        elif compgen -G "$FLASHINFER_WHEELS_DIR/flashinfer*.whl" > /dev/null 2>&1; then
             echo "Download failed — using existing local FlashInfer wheels."
         else
-            echo "No FlashInfer wheels available (download failed) — building..."
-            BUILD_FLASHINFER=true
+            echo "Error: No precompiled FlashInfer wheels are available and the download failed."
+            echo "       Re-run with --rebuild-flashinfer to explicitly build FlashInfer from source."
+            exit 1
         fi
 
         if [ "$BUILD_FLASHINFER" = true ]; then
-            # Back up existing flashinfer wheels; restore them if the build fails
-            FI_BACKUP="./wheels/.backup-flashinfer"
-            rm -rf "$FI_BACKUP" && mkdir -p "$FI_BACKUP"
-            for f in ./wheels/flashinfer*.whl; do
-                [ -f "$f" ] && mv "$f" "$FI_BACKUP/"
-            done
+            FLASHINFER_STAGING_DIR=$(mktemp -d "$WHEEL_CACHE_ROOT/.flashinfer-${FLASHINFER_PROFILE}.XXXXXX")
 
             FI_CMD=("docker" "build"
                 "--target" "flashinfer-export"
-                "--output" "type=local,dest=./wheels"
+                "--output" "type=local,dest=$FLASHINFER_STAGING_DIR"
                 "${COMMON_BUILD_FLAGS[@]}"
                 "--build-arg" "FLASHINFER_REF=$FLASHINFER_REF")
 
@@ -559,14 +1054,14 @@ if [ "$NO_BUILD" = false ]; then
 
             echo "FlashInfer build command: ${FI_CMD[*]}"
             FI_START=$(date +%s)
-            if "${FI_CMD[@]}"; then
+            if "${FI_CMD[@]}" && \
+               validate_exported_wheel_set "flashinfer" "$FLASHINFER_STAGING_DIR" && \
+               promote_wheel_set "$FLASHINFER_STAGING_DIR" "$FLASHINFER_WHEELS_DIR"; then
+                FLASHINFER_STAGING_DIR=""
                 FI_END=$(date +%s)
                 FLASHINFER_BUILD_TIME=$((FI_END - FI_START))
-                rm -rf "$FI_BACKUP"
             else
-                echo "FlashInfer build failed — restoring previous wheels..."
-                mv "$FI_BACKUP"/flashinfer*.whl ./wheels/ 2>/dev/null || true
-                rm -rf "$FI_BACKUP"
+                echo "FlashInfer build failed — keeping the previous wheel profile unchanged."
                 exit 1
             fi
         fi
@@ -574,44 +1069,73 @@ if [ "$NO_BUILD" = false ]; then
         # ----------------------------------------------------------
         # Phase 2: vLLM wheels
         # ----------------------------------------------------------
-        if [ "$VLLM_REF_SET" = true ] || [ -n "$VLLM_PRS" ]; then
+        if { [ "$VLLM_PROFILE" = "custom" ] && [ "$USE_WHEELS" != true ]; } || \
+           [ "$VLLM_REF_SET" = true ] || [ "$VLLM_PR_APPLICATION_REQUESTED" = true ]; then
             REBUILD_VLLM=true
         fi
 
         BUILD_VLLM=false
         if [ "$REBUILD_VLLM" = true ]; then
-            if [ "$VLLM_REF_SET" = true ] && [ -n "$VLLM_PRS" ]; then
-                echo "Rebuilding vLLM wheels (--vllm-ref and --apply-vllm-pr specified)..."
+            if [ "$EXP_B12X" = true ] && [ -n "$VLLM_PRS" ]; then
+                echo "Rebuilding vLLM wheels (--exp-b12x preset with requested vLLM PRs)..."
+            elif [ "$EXP_B12X" = true ]; then
+                echo "Rebuilding vLLM wheels (--exp-b12x preset)..."
+            elif [ "$VLLM_REF_SET" = true ] && [ "$VLLM_PR_APPLICATION_REQUESTED" = true ]; then
+                echo "Rebuilding vLLM wheels (applying vLLM PRs to --vllm-ref $VLLM_REF)..."
             elif [ "$VLLM_REF_SET" = true ]; then
                 echo "Rebuilding vLLM wheels (--vllm-ref specified)..."
+            elif [ "$CUSTOM_VLLM_REPO" = true ]; then
+                echo "Rebuilding vLLM wheels (--vllm-repo specified)..."
             elif [ -n "$VLLM_PRS" ]; then
                 echo "Rebuilding vLLM wheels (--apply-vllm-pr specified)..."
+            elif [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+                echo "Rebuilding vLLM wheels (--apply-preset-vllm-prs specified)..."
+            elif [ "$VLLM_ARCH_REBUILD" = true ]; then
+                echo "Rebuilding vLLM wheels for GPU architecture $GPU_ARCH_LIST..."
             else
                 echo "Rebuilding vLLM wheels (--rebuild-vllm specified)..."
             fi
             BUILD_VLLM=true
-        elif try_download_wheels "$VLLM_RELEASE_TAG" "vllm"; then
+        elif [ "$VLLM_PROFILE" != "regular" ]; then
+            if compgen -G "$VLLM_WHEELS_DIR/vllm*.whl" > /dev/null 2>&1; then
+                echo "Using cached $VLLM_PROFILE vLLM wheel."
+            else
+                echo "Error: No cached $VLLM_PROFILE vLLM wheel is available."
+                echo "       vLLM wheels for this profile are not downloaded from the regular release."
+                echo "       Re-run with --rebuild-vllm to build it from source."
+                exit 1
+            fi
+        elif try_download_wheels "$VLLM_RELEASE_TAG" "vllm" "$FORCE_VLLM_DOWNLOAD" "$VLLM_WHEELS_DIR"; then
+            printf '%s\n' "$GPU_ARCH_LIST" > "$VLLM_WHEELS_DIR/.vllm-arch"
             echo "vLLM wheels ready."
-        elif compgen -G "./wheels/vllm*.whl" > /dev/null 2>&1; then
+        elif compgen -G "$VLLM_WHEELS_DIR/vllm*.whl" > /dev/null 2>&1; then
             echo "Download failed — using existing local vLLM wheels."
         else
-            echo "No vLLM wheels available (download failed) — building..."
-            BUILD_VLLM=true
+            echo "Error: No precompiled vLLM wheels are available and the download failed."
+            echo "       Re-run with --rebuild-vllm to explicitly build vLLM from source."
+            exit 1
         fi
 
         if [ "$BUILD_VLLM" = true ]; then
-            # Back up existing vllm wheels; restore them if the build fails
-            VLLM_BACKUP="./wheels/.backup-vllm"
-            rm -rf "$VLLM_BACKUP" && mkdir -p "$VLLM_BACKUP"
-            for f in ./wheels/vllm*.whl; do
-                [ -f "$f" ] && mv "$f" "$VLLM_BACKUP/"
-            done
+            VLLM_STAGING_DIR=$(mktemp -d "$WHEEL_CACHE_ROOT/.vllm-${VLLM_PROFILE}.XXXXXX")
 
             VLLM_CMD=("docker" "build"
                 "--target" "vllm-export"
-                "--output" "type=local,dest=./wheels"
+                "--output" "type=local,dest=$VLLM_STAGING_DIR"
                 "${COMMON_BUILD_FLAGS[@]}"
-                "--build-arg" "VLLM_REF=$VLLM_REF")
+                "--build-arg" "VLLM_REF=$VLLM_REF"
+                "--build-arg" "VLLM_REPO=$VLLM_REPO")
+
+            if [ "$APPLY_PRESET_VLLM_PRS" = true ]; then
+                echo "Applying preset vLLM PRs from the Dockerfile (explicitly requested)."
+                VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=1")
+            elif [ "$CUSTOM_VLLM_REPO" = true ] || [ "$VLLM_REF_SET" = true ] || [ -n "$VLLM_PRS" ]; then
+                echo "Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified."
+                VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=0")
+            else
+                echo "Applying preset vLLM PRs from the Dockerfile by default."
+                VLLM_CMD+=("--build-arg" "VLLM_APPLY_PRESET_PRS=1")
+            fi
 
             if [ "$REBUILD_VLLM" = true ]; then
                 VLLM_CMD+=("--build-arg" "CACHEBUST_VLLM=$(date +%s)")
@@ -622,18 +1146,26 @@ if [ "$NO_BUILD" = false ]; then
                 VLLM_CMD+=("--build-arg" "VLLM_PRS=$VLLM_PRS")
             fi
 
+            if [ "$EXP_B12X" = true ]; then
+                # Preserve selected Blackwell subarchitectures. This prevents
+                # 10.3a and 12.1a from being reduced to plain sm_100/sm_120
+                # without overriding explicit family-target selections.
+                VLLM_CMD+=("--build-arg" "VLLM_PRESERVE_SM12X_TARGET=1")
+                VLLM_CMD+=("--build-arg" "VLLM_PATCH_B12X_C128A_ALIGNMENT=1")
+            fi
+
             VLLM_CMD+=(".")
 
             echo "vLLM build command: ${VLLM_CMD[*]}"
             VLLM_START=$(date +%s)
-            if "${VLLM_CMD[@]}"; then
+            if "${VLLM_CMD[@]}" && \
+               validate_exported_wheel_set "vllm" "$VLLM_STAGING_DIR" && \
+               promote_wheel_set "$VLLM_STAGING_DIR" "$VLLM_WHEELS_DIR"; then
+                VLLM_STAGING_DIR=""
                 VLLM_END=$(date +%s)
                 VLLM_BUILD_TIME=$((VLLM_END - VLLM_START))
-                rm -rf "$VLLM_BACKUP"
             else
-                echo "vLLM build failed — restoring previous wheels..."
-                mv "$VLLM_BACKUP"/vllm*.whl ./wheels/ 2>/dev/null || true
-                rm -rf "$VLLM_BACKUP"
+                echo "vLLM build failed — keeping the previous wheel profile unchanged."
                 exit 1
             fi
         fi
@@ -641,27 +1173,32 @@ if [ "$NO_BUILD" = false ]; then
         # ----------------------------------------------------------
         # Phase 3: Runner image
         # ----------------------------------------------------------
-        if ! compgen -G "./wheels/*.whl" > /dev/null 2>&1; then
-            echo "Error: No wheel files found in ./wheels/ — cannot build runner image."
+        if ! validate_runner_wheel_inputs "$FLASHINFER_WHEELS_DIR" "$VLLM_WHEELS_DIR"; then
+            echo "Error: Selected wheel profiles are incomplete — cannot build runner image."
             exit 1
         fi
 
         # Generate build metadata YAML
-        VLLM_VERSION=$(ls ./wheels/vllm-*.whl 2>/dev/null | head -1 | sed 's|.*/vllm-||;s|-.*||')
+        VLLM_VERSION=$(ls "$VLLM_WHEELS_DIR"/vllm-*.whl 2>/dev/null | head -1 | sed 's|.*/vllm-||;s|-.*||')
         VLLM_COMMIT=""
-        [ -f "./wheels/.vllm-commit" ] && VLLM_COMMIT=$(cat ./wheels/.vllm-commit)
+        [ -f "$VLLM_WHEELS_DIR/.vllm-commit" ] && VLLM_COMMIT=$(cat "$VLLM_WHEELS_DIR/.vllm-commit")
         FLASHINFER_COMMIT=""
-        [ -f "./wheels/.flashinfer-commit" ] && FLASHINFER_COMMIT=$(cat ./wheels/.flashinfer-commit)
+        [ -f "$FLASHINFER_WHEELS_DIR/.flashinfer-commit" ] && FLASHINFER_COMMIT=$(cat "$FLASHINFER_WHEELS_DIR/.flashinfer-commit")
         generate_build_metadata Dockerfile "$VLLM_VERSION" "$VLLM_COMMIT" "$FLASHINFER_COMMIT" \
-            "$VLLM_REF" "$PRE_TRANSFORMERS" "false" "$VLLM_PRS"
+            "$VLLM_REF" "true" "false" "$VLLM_PRS" "$VLLM_REPO" "$TORCH_VERSION" \
+            "${TORCHVISION_VERSION:-resolver-selected}" "${TORCHAUDIO_VERSION:-resolver-selected}" \
+            "${B12X_REPO:-disabled}" "${B12X_REF:-disabled}" "$CUTLASS_DSL_VERSION"
 
         RUNNER_CMD=("docker" "build"
             "-t" "$IMAGE_TAG"
-            "${COMMON_BUILD_FLAGS[@]}")
+            "${COMMON_BUILD_FLAGS[@]}"
+            "--build-context" "flashinfer_wheels=$FLASHINFER_WHEELS_DIR"
+            "--build-context" "vllm_wheels=$VLLM_WHEELS_DIR")
 
-        if [ "$PRE_TRANSFORMERS" = true ]; then
-            echo "Using transformers>=5.0.0..."
-            RUNNER_CMD+=("--build-arg" "PRE_TRANSFORMERS=1")
+        if [ -n "$B12X_REPO" ]; then
+            RUNNER_CMD+=("--build-arg" "B12X_REPO=$B12X_REPO")
+            RUNNER_CMD+=("--build-arg" "B12X_REF=$B12X_REF")
+            RUNNER_CMD+=("--build-arg" "B12X_CACHEBUST=$B12X_CACHEBUST")
         fi
 
         RUNNER_CMD+=(".")
@@ -681,41 +1218,69 @@ fi
 # =====================================================
 COPY_TIME=0
 if [ "${#COPY_HOSTS[@]}" -gt 0 ]; then
-    echo "Copying image '$IMAGE_TAG' to ${#COPY_HOSTS[@]} host(s): ${COPY_HOSTS[*]}"
-    if [ "$PARALLEL_COPY" = true ]; then
-        echo "Parallel copy enabled."
-    fi
+    echo "Checking image '$IMAGE_TAG' on ${#COPY_HOSTS[@]} host(s): ${COPY_HOSTS[*]}"
     COPY_START=$(date +%s)
 
-    TMP_IMAGE=$(mktemp -t vllm_image.XXXXXX)
-    echo "Saving image locally to $TMP_IMAGE..."
-    docker save -o "$TMP_IMAGE" "$IMAGE_TAG"
-
-    if [ "$PARALLEL_COPY" = true ]; then
-        PIDS=()
-        for host in "${COPY_HOSTS[@]}"; do
-            copy_to_host "$host" &
-            PIDS+=($!)
-        done
-        COPY_FAILURE=0
-        for pid in "${PIDS[@]}"; do
-            if ! wait "$pid"; then
-                COPY_FAILURE=1
-            fi
-        done
-        if [ "$COPY_FAILURE" -ne 0 ]; then
-            echo "One or more copies failed."
-            exit 1
-        fi
-    else
-        for host in "${COPY_HOSTS[@]}"; do
-            copy_to_host "$host"
-        done
+    if ! LOCAL_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE_TAG"); then
+        echo "Error: Local image '$IMAGE_TAG' not found."
+        exit 1
     fi
 
-    COPY_END=$(date +%s)
-    COPY_TIME=$((COPY_END - COPY_START))
-    echo "Copy complete."
+    COPY_TARGETS=()
+    for host in "${COPY_HOSTS[@]}"; do
+        REMOTE_IMAGE_ID=$(get_remote_image_id "$host" "$IMAGE_TAG" || true)
+        if [ -n "$REMOTE_IMAGE_ID" ] && [ "$REMOTE_IMAGE_ID" = "$LOCAL_IMAGE_ID" ]; then
+            echo "Image '$IMAGE_TAG' is already up to date on ${SSH_USER}@${host}; skipping."
+        else
+            if [ -n "$REMOTE_IMAGE_ID" ]; then
+                echo "Image '$IMAGE_TAG' differs on ${SSH_USER}@${host}; will copy."
+            else
+                echo "Image '$IMAGE_TAG' not found on ${SSH_USER}@${host}; will copy."
+            fi
+            COPY_TARGETS+=("$host")
+        fi
+    done
+
+    if [ "${#COPY_TARGETS[@]}" -eq 0 ]; then
+        COPY_END=$(date +%s)
+        COPY_TIME=$((COPY_END - COPY_START))
+        echo "All remote images are up to date; skipping save/copy."
+    else
+        echo "Copying image '$IMAGE_TAG' to ${#COPY_TARGETS[@]} host(s): ${COPY_TARGETS[*]}"
+        if [ "$PARALLEL_COPY" = true ]; then
+            echo "Parallel copy enabled."
+        fi
+
+        TMP_IMAGE=$(mktemp -t vllm_image.XXXXXX)
+        echo "Saving image locally to $TMP_IMAGE..."
+        docker save -o "$TMP_IMAGE" "$IMAGE_TAG"
+
+        if [ "$PARALLEL_COPY" = true ]; then
+            PIDS=()
+            for host in "${COPY_TARGETS[@]}"; do
+                copy_to_host "$host" &
+                PIDS+=($!)
+            done
+            COPY_FAILURE=0
+            for pid in "${PIDS[@]}"; do
+                if ! wait "$pid"; then
+                    COPY_FAILURE=1
+                fi
+            done
+            if [ "$COPY_FAILURE" -ne 0 ]; then
+                echo "One or more copies failed."
+                exit 1
+            fi
+        else
+            for host in "${COPY_TARGETS[@]}"; do
+                copy_to_host "$host"
+            done
+        fi
+
+        COPY_END=$(date +%s)
+        COPY_TIME=$((COPY_END - COPY_START))
+        echo "Copy complete."
+    fi
 else
     echo "No host specified, skipping copy."
 fi
@@ -729,6 +1294,9 @@ echo ""
 echo "========================================="
 echo "         TIMING STATISTICS"
 echo "========================================="
+if [ "$PREBUILT_PULL_TIME" -gt 0 ]; then
+    echo "Prebuilt Pull:    $(printf '%02d:%02d:%02d' $((PREBUILT_PULL_TIME/3600)) $((PREBUILT_PULL_TIME%3600/60)) $((PREBUILT_PULL_TIME%60)))"
+fi
 if [ "$FLASHINFER_BUILD_TIME" -gt 0 ]; then
     echo "FlashInfer Build: $(printf '%02d:%02d:%02d' $((FLASHINFER_BUILD_TIME/3600)) $((FLASHINFER_BUILD_TIME%3600/60)) $((FLASHINFER_BUILD_TIME%60)))"
 fi
@@ -743,4 +1311,4 @@ if [ "$COPY_TIME" -gt 0 ]; then
 fi
 echo "Total Time:       $(printf '%02d:%02d:%02d' $((TOTAL_TIME/3600)) $((TOTAL_TIME%3600/60)) $((TOTAL_TIME%60)))"
 echo "========================================="
-echo "Done building $IMAGE_TAG."
+echo "Done preparing $IMAGE_TAG."
