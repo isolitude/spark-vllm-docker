@@ -1995,10 +1995,12 @@ applied in the order specified. With direct launcher use, `--apply-mod` and
 `--apply-vllm-pr` share command-line ordering. With recipes, recipe-declared
 mods remain first, followed by command-line layers in their specified order.
 
-The runtime path only applies files installed under `vllm/`; tests, docs, and
-examples are ignored. A PR that changes CUDA/C++, build configuration,
-dependencies, packaging, or other source-tree files is rejected. Apply such a
-PR while building the image instead:
+The runtime path only applies files installed under `vllm/`. Tests, docs,
+examples, CI configuration, and the source tree's `setup.py` are ignored.
+Ignoring `setup.py` does not install or update dependencies, so the container
+must already provide any package version required by the PR. A PR that changes
+CUDA/C++ or other unrecognized build/source-tree files is rejected. Apply such
+a PR while building the image instead:
 
 ```bash
 ./build-and-copy.sh --apply-vllm-pr 12345
