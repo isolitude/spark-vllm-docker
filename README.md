@@ -37,7 +37,7 @@ We will expand the selection of models we test in the pipeline, but since vLLM i
 Selecting `--exp-b12x` without local-build flags or customizations pulls the separately tested
 `eugr/spark-vllm-b12x:latest` image and tags it as `vllm-node-b12x`.
 
-If you want to build only the runner from precompiled vLLM and FlashInfer wheels, specify `--use-wheels`. This option never falls back to compiling missing wheels: if a wheel cannot be downloaded or found locally, the command stops with an error. To build the latest vLLM from the main branch, use `--rebuild-vllm`; to target a specific repository, release, or commit, set `--vllm-repo` and/or `--vllm-ref`.
+If you want to build only the runner from precompiled vLLM and FlashInfer wheels, specify `--use-wheels`. This option never falls back to compiling missing wheels: if a wheel cannot be downloaded or found locally, the command stops with an error. To build the latest vLLM from the main branch, use `--rebuild-vllm`; to target a specific repository, release, or commit, set `--vllm-repo` and/or `--vllm-ref`. To build a private or already-available checkout without cloning it inside Docker, use `--vllm-source-dir`.
 
 Similarly, `--rebuild-flashinfer`, `--flashinfer-ref`, and `--apply-flashinfer-pr` control the FlashInfer build and force the local build path.
 
@@ -167,6 +167,15 @@ Don't do it every time you rebuild, because it will slow down compilation times.
 For periodic maintenance, I recommend using a filter: `docker builder prune --filter until=72h`
 
 ## CHANGELOG
+
+### 2026-08-25
+
+#### Local vLLM source checkouts
+
+`build-and-copy.sh --vllm-source-dir <path>` now builds vLLM from a clean local
+Git checkout without requiring the Docker builder to access its remote or host
+credentials. An optional `--vllm-ref` is resolved locally; otherwise the build
+uses the checkout's current `HEAD`. The host checkout is never modified.
 
 ### 2026-08-21
 
@@ -1467,6 +1476,23 @@ Using a different username:
   --torchaudio-version none
 ```
 
+**Build a clean local vLLM checkout:**
+
+```bash
+./build-and-copy.sh \
+  --vllm-source-dir /path/to/vllm \
+  --vllm-ref branch-or-commit
+```
+
+The ref must already be available in the local checkout; this path never
+fetches or modifies the source directory. Without `--vllm-ref`, the selected
+commit is the checkout's current `HEAD`. The wrapper creates a temporary,
+self-contained staging checkout and passes it to Docker as a named build
+context. Dirty checkouts and repositories with Git submodules are rejected.
+`--vllm-source-dir` is incompatible with `--vllm-repo`, `--use-wheels`,
+`--force-vllm-download`, `--no-build`, and the separate `--exp-mxfp4` and
+`--exp-b12x` profiles.
+
 For the maintained experimental B12X combination, the equivalent shortcut is:
 
 ```bash
@@ -1493,7 +1519,7 @@ including B12X: alternate targets rebuild FlashInfer when no matching
 architecture marker is present, and the cached wheel records its architecture
 so a later build cannot silently reuse a wheel for a different target.
 
-Custom vLLM repositories are cloned fresh instead of using the shared upstream checkout cache. Specifying a custom repository forces a vLLM source build. Upstream preset PRs are skipped by default for custom repositories and refs.
+Custom vLLM repositories are cloned fresh instead of using the shared upstream checkout cache. Specifying a custom repository or local source checkout forces a vLLM source build. Upstream preset PRs are skipped by default for custom repositories, local source checkouts, and refs.
 
 Wheel profiles are selected automatically:
 
@@ -1533,7 +1559,8 @@ For regular `vllm-project/vllm` builds and any branch, tag, or commit selected f
 | `--force-vllm-download` | Force download vLLM wheels, skipping cached wheel checks |
 | `--force-download` | Force download all prebuilt wheels, skipping cached wheel checks |
 | `--vllm-repo <url>` | vLLM Git repository. Defaults to `https://github.com/vllm-project/vllm.git`; custom repositories bypass the shared checkout cache and force a source build. |
-| `--vllm-ref <ref>` | vLLM commit SHA, branch or tag (default: `main`) |
+| `--vllm-source-dir <path>` | Build vLLM from a clean local Git checkout staged into Docker without remote credentials. Incompatible with `--vllm-repo`, wheel/download-only paths, `--no-build`, and experimental build profiles. |
+| `--vllm-ref <ref>` | vLLM commit SHA, branch or tag. Defaults to `main` for remote repositories and the current `HEAD` with `--vllm-source-dir`. |
 | `--torch-version <version>` | PyTorch version installed in source-build and runner stages (default: `2.13.0`) |
 | `--torchvision-version <version>` | Optional torchvision version (default: `0.28.0`) |
 | `--torchaudio-version <version>` | Optional torchaudio version (default: `2.11.0`; use `none` to omit it) |

@@ -175,6 +175,20 @@ run_build() {
     ) > "$OUTPUT_LOG" 2>&1
 }
 
+create_local_vllm_source() {
+    LOCAL_VLLM_SOURCE_DIR="$CASE_DIR/local-vllm"
+    mkdir -p "$LOCAL_VLLM_SOURCE_DIR"
+    git -C "$LOCAL_VLLM_SOURCE_DIR" init -q
+    git -C "$LOCAL_VLLM_SOURCE_DIR" config user.name "Build Test"
+    git -C "$LOCAL_VLLM_SOURCE_DIR" config user.email "build-test@example.invalid"
+    git -C "$LOCAL_VLLM_SOURCE_DIR" config commit.gpgsign false
+    printf '[build-system]\nrequires = []\n' > "$LOCAL_VLLM_SOURCE_DIR/pyproject.toml"
+    git -C "$LOCAL_VLLM_SOURCE_DIR" add pyproject.toml
+    git -C "$LOCAL_VLLM_SOURCE_DIR" commit -q -m "local vLLM fixture"
+    git -C "$LOCAL_VLLM_SOURCE_DIR" branch -M qwen38next
+    LOCAL_VLLM_SOURCE_COMMIT=$(git -C "$LOCAL_VLLM_SOURCE_DIR" rev-parse HEAD)
+}
+
 assert_log_contains() {
     local pattern="$1"
     if ! grep -Eq "$pattern" "$TEST_LOG"; then
@@ -524,6 +538,74 @@ test_custom_vllm_repo_forces_source_build() {
     assert_output_contains 'Rebuilding vLLM wheels \(--vllm-repo specified\)\.\.\.'
     assert_output_contains 'Skipping preset vLLM PRs because --vllm-repo, --vllm-ref, or --apply-vllm-pr was specified\.'
     pass "--vllm-repo forces a source build and suppresses upstream preset PRs"
+}
+
+test_local_vllm_source_builds_selected_ref() {
+    setup_fixture
+    create_local_vllm_source
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" --vllm-ref qwen38next || \
+        fail "--vllm-source-dir run failed"
+    assert_log_not_contains '^docker pull eugr/spark-vllm:latest$'
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF=qwen38next --build-arg VLLM_REPO=local-source .*--build-context vllm_source=.*/spark-vllm-source\.[^/]+/vllm --build-arg VLLM_SOURCE_MODE=local --build-arg VLLM_SOURCE_COMMIT='"$LOCAL_VLLM_SOURCE_COMMIT"
+    assert_log_contains '^docker build -t vllm-node .*--build-context flashinfer_wheels=\./\.wheel-cache/flashinfer/regular --build-context vllm_wheels=\./\.wheel-cache/vllm/custom '
+    assert_log_not_contains 'B12X_REPO='
+    assert_output_contains 'Using clean local vLLM source at commit '"$LOCAL_VLLM_SOURCE_COMMIT"'\.'
+    assert_output_contains 'Rebuilding vLLM wheels \(--vllm-source-dir specified\)\.\.\.'
+    assert_output_contains 'Skipping preset vLLM PRs because --vllm-source-dir was specified\.'
+    if grep -Fq "$LOCAL_VLLM_SOURCE_DIR" "$OUTPUT_LOG"; then
+        fail "local source path leaked into build output"
+    fi
+    if [ "$(git -C "$LOCAL_VLLM_SOURCE_DIR" branch --show-current)" != "qwen38next" ] || \
+       [ -n "$(git -C "$LOCAL_VLLM_SOURCE_DIR" status --porcelain)" ]; then
+        fail "local source checkout was modified by the build wrapper"
+    fi
+    pass "--vllm-source-dir stages and builds the selected local ref"
+}
+
+test_local_vllm_source_defaults_to_head() {
+    setup_fixture
+    create_local_vllm_source
+    run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" || \
+        fail "--vllm-source-dir HEAD run failed"
+    assert_log_contains '^docker build --target vllm-export .*--build-arg VLLM_REF='"$LOCAL_VLLM_SOURCE_COMMIT"' --build-arg VLLM_REPO=local-source '
+    assert_log_contains 'VLLM_SOURCE_COMMIT='"$LOCAL_VLLM_SOURCE_COMMIT"
+    pass "--vllm-source-dir defaults to the checkout HEAD"
+}
+
+test_local_vllm_source_rejects_conflicting_repo() {
+    setup_fixture
+    create_local_vllm_source
+    if run_build \
+        --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" \
+        --vllm-repo https://github.com/example/vllm.git; then
+        fail "--vllm-source-dir unexpectedly accepted --vllm-repo"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'Error: --vllm-source-dir is incompatible with --vllm-repo\.'
+    pass "--vllm-source-dir rejects an explicit repository"
+}
+
+test_local_vllm_source_rejects_dirty_checkout() {
+    setup_fixture
+    create_local_vllm_source
+    printf '# dirty\n' >> "$LOCAL_VLLM_SOURCE_DIR/pyproject.toml"
+    if run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR"; then
+        fail "--vllm-source-dir unexpectedly accepted a dirty checkout"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains 'Error: --vllm-source-dir must be clean; commit or stash local changes first\.'
+    pass "--vllm-source-dir rejects a dirty checkout"
+}
+
+test_local_vllm_source_rejects_missing_ref() {
+    setup_fixture
+    create_local_vllm_source
+    if run_build --vllm-source-dir "$LOCAL_VLLM_SOURCE_DIR" --vllm-ref missing-ref; then
+        fail "--vllm-source-dir unexpectedly accepted a missing ref"
+    fi
+    assert_log_not_contains '^docker build'
+    assert_output_contains "Error: --vllm-ref 'missing-ref' is not available in the local vLLM checkout\."
+    pass "--vllm-source-dir resolves refs without fetching"
 }
 
 test_exp_b12x_uses_prebuilt_image() {
@@ -886,6 +968,20 @@ test_dockerfile_custom_repo_bypasses_shared_cache() {
     pass "custom vLLM repositories bypass the shared upstream checkout cache"
 }
 
+test_dockerfile_accepts_local_vllm_context() {
+    for expected in \
+        'FROM scratch AS vllm_source' \
+        '--mount=type=bind,from=vllm_source,target=/tmp/vllm-local-source' \
+        'if [ "$VLLM_SOURCE_MODE" = "local" ]' \
+        'if [ "$(git rev-parse HEAD)" != "$VLLM_SOURCE_COMMIT" ]' \
+        'git remote remove origin 2>/dev/null || true'; do
+        if ! grep -Fq -- "$expected" "$PROJECT_DIR/Dockerfile"; then
+            fail "Dockerfile local vLLM source block is missing: $expected"
+        fi
+    done
+    pass "Dockerfile consumes a verified local vLLM named context"
+}
+
 test_dockerfile_uses_configurable_torch_versions() {
     if [ "$(grep -Fc 'set -- "torch==$TORCH_VERSION" "$TORCHVISION_SPEC"' "$PROJECT_DIR/Dockerfile")" -ne 2 ] || \
        [ "$(grep -Fc 'uv pip install "$@" triton' "$PROJECT_DIR/Dockerfile")" -ne 2 ]; then
@@ -1141,6 +1237,11 @@ test_vllm_ref_can_apply_preset_prs_explicitly
 test_apply_preset_prs_forces_vllm_rebuild
 test_requested_vllm_prs_apply_to_selected_vllm_ref
 test_custom_vllm_repo_forces_source_build
+test_local_vllm_source_builds_selected_ref
+test_local_vllm_source_defaults_to_head
+test_local_vllm_source_rejects_conflicting_repo
+test_local_vllm_source_rejects_dirty_checkout
+test_local_vllm_source_rejects_missing_ref
 test_exp_b12x_uses_prebuilt_image
 test_exp_b12x_rebuild_vllm_uses_preset_source_build
 test_exp_b12x_allows_vllm_prs
@@ -1158,6 +1259,7 @@ test_custom_torch_versions_are_forwarded
 test_local_inference_lab_b12x_applies_to_any_ref
 test_local_inference_lab_b12x_requires_torch_212
 test_dockerfile_custom_repo_bypasses_shared_cache
+test_dockerfile_accepts_local_vllm_context
 test_dockerfile_uses_configurable_torch_versions
 test_dockerfile_pins_cutlass_dsl_47_everywhere
 test_dockerfile_uses_profiled_named_wheel_contexts
