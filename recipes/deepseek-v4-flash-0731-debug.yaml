@@ -1,19 +1,27 @@
-# Recipe: DeepSeek V4 Flash 0731
-# DeepSeek V4 Flash using the B12X-optimized serving stack on an SM121 cluster
+# Recipe: DeepSeek V4 Flash 0731 (DSML debug)
+# Identical to deepseek-v4-flash-0731 except for request/response logging.
+# Purpose: capture the raw model text that the DSML parser sees, alongside the
+# parsed result, to debug tool-call parse failures (orphan invoke / closing tail).
+#
+# Serving config is deliberately byte-for-byte the same as the production recipe
+# (same mods, same max_num_seqs, same speculative config) so the bug reproduces
+# under identical conditions. The only delta is observability.
 
 recipe_version: "1"
-name: DeepSeek-V4-Flash-0731
-description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-0731 on a dual Sparks using B12X docker
+name: DeepSeek-V4-Flash-0731-Debug
+description: DeepSeek-V4-Flash-0731 with raw+parsed output logging for DSML tool-call debugging
 
 model: deepseek-ai/DeepSeek-V4-Flash-0731
 container: vllm-node-b12x
-container_name: vllm_deepseek_v4_flash_0731
+container_name: vllm_deepseek_v4_flash_0731_debug
 
 build_args:
   - --exp-b12x
 
 cluster_only: true
 
+# Keep in sync with deepseek-v4-flash-0731.yaml. Comment a mod out to get a
+# baseline of the unpatched parser behaviour for comparison.
 mods:
   - mods/instanttensor-hybrid-draft-loader
   - mods/fix-deepseek-v4-dsml-recovery
@@ -48,6 +56,10 @@ env:
   VLLM_MOE_SKIP_PADDING: "0"
   B12X_MLA_SM120_UNIFIED: "1"
   B12X_MOE_FORCE_A8: "1"
+  # log_outputs() is logger.info, so INFO is enough for output logging.
+  # Set to DEBUG to also log the rendered prompt (log_inputs is DEBUG-gated) --
+  # useful for confirming residual DSML is contaminating the next turn's context.
+  VLLM_LOGGING_LEVEL: "INFO"
 
 command: |
   vllm serve deepseek-ai/DeepSeek-V4-Flash-0731 \
@@ -75,4 +87,7 @@ command: |
       --attention-backend B12X_MLA_SPARSE \
       --max-cudagraph-capture-size {max_cudagraph_capture_size} \
       --compilation-config '{{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}}' \
-      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic","attention_backend":"B12X_MLA_SPARSE"}}'
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens},"draft_sample_method":"probabilistic","attention_backend":"B12X_MLA_SPARSE"}}' \
+      --enable-log-requests \
+      --enable-log-outputs \
+      --no-enable-log-deltas

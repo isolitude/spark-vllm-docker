@@ -14,5 +14,6 @@ wheels
 myrecipe/
 output.log
 env/
+data/
 __pycache__/
 .claude/
