@@ -31,13 +31,34 @@ on any upstream formatting drift.
 
 ## What this mod does
 
-Ships **complete replacement files** under `files/` and writes them out
-wholesale (no anchor matching) to:
+Ships **complete replacement files** and writes them out wholesale (no anchor
+matching) to:
 
 - `vllm/parser/deepseek_v4.py`
 - `vllm/parser/engine/parser_engine_config.py`
 - `vllm/parser/engine/streaming_parser_engine.py`
 - `vllm/parser/engine/parser_engine.py`
+
+### Version-aware file sets
+
+Upstream vLLM refactored the parser engine between image generations. The
+recovery logic is orthogonal to that refactor, so the mod keeps two
+replacement sets under `patch_vllm.py`'s directory and auto-selects by
+detecting the installed engine:
+
+- **`files-0823/`** — for images whose engine lacks the 0904 `token_count`
+  refactor (`eugr/spark-vllm-b12x:0823` and earlier). This is the original
+  mod content (byte-identical to the legacy `files/` directory).
+- **`files-0904/`** — for images whose engine has the 0904 `token_count` /
+  `reasoning_token_count` refactor (`eugr/spark-vllm-b12x:latest`, the 0904
+  build). Every upstream `token_count` / `reasoning_token_count` hook is
+  preserved; the same recovery branches are added on top.
+
+Detection rule: the 0904 refactor is present iff
+`engine/streaming_parser_engine.py` references `_reasoning_token_count` /
+`reasoning_token_count`. For unknown images, override with
+`patch_vllm.py --files-dir <dir>`. The legacy `files/` directory remains as
+an alias of `files-0823`.
 
 **Recoverable case (shape 1):** a provisional-hold mechanism (ported from
 the design proven in `fix-deepseek-v4-orphan-invoke-full` / upstream vLLM PR
@@ -71,27 +92,40 @@ it for diffing/rollback.
 
 ## Testing
 
-Verified against `eugr/spark-vllm-b12x:latest`:
+Verified against both image generations (`eugr/spark-vllm-b12x:0823` and
+`eugr/spark-vllm-b12x:latest`, the 0904 build):
 
 ```
-docker run -d --name dsml-test --entrypoint sleep eugr/spark-vllm-b12x:latest infinity
-docker cp mods/fix-deepseek-v4-dsml-recovery dsml-test:/tmp/mod
-docker exec dsml-test /tmp/mod/run.sh
-docker cp mods/fix-deepseek-v4-dsml-recovery/test_dsml_recovery.py dsml-test:/tmp/
-docker exec dsml-test python3 /tmp/test_dsml_recovery.py
+# 0823 (pre-refactor engine)
+docker run -d --name dsml-test-0823 --entrypoint sleep eugr/spark-vllm-b12x:0823 infinity
+docker cp mods/fix-deepseek-v4-dsml-recovery dsml-test-0823:/tmp/mod
+docker exec dsml-test-0823 /tmp/mod/run.sh          # -> "Detected parser-engine version: 0823  (files-0823)"
+docker cp mods/fix-deepseek-v4-dsml-recovery/test_dsml_recovery.py dsml-test-0823:/tmp/
+docker exec dsml-test-0823 python3 /tmp/test_dsml_recovery.py
+
+# 0904 (token_count / reasoning_token_count refactor)
+docker run -d --name dsml-test-0904 --entrypoint sleep eugr/spark-vllm-b12x:latest infinity
+docker cp mods/fix-deepseek-v4-dsml-recovery dsml-test-0904:/tmp/mod
+docker exec dsml-test-0904 /tmp/mod/run.sh          # -> "Detected parser-engine version: 0904  (files-0904)"
+docker cp mods/fix-deepseek-v4-dsml-recovery/test_dsml_recovery.py dsml-test-0904:/tmp/
+docker exec dsml-test-0904 python3 /tmp/test_dsml_recovery.py
 ```
 
-`test_dsml_recovery.py` (9 cases): fullwidth + ASCII orphan-invoke recovery,
-invalid-name rollback, prose false-positive guard, DSML + ASCII orphan
-closing tail regenerate, recovered-call-then-leftover-closer (no double
-regen), undeclared-bash guard, bare-parameter-fragment regenerate. All pass.
+`test_dsml_recovery.py` (9 cases) passes on **both** versions: fullwidth +
+ASCII orphan-invoke recovery, invalid-name rollback, prose false-positive
+guard, DSML + ASCII orphan closing tail regenerate, recovered-call-then-
+leftover-closer (no double regen), undeclared-bash guard, bare-parameter-
+fragment regenerate.
+
+An additional regression check (not part of `test_dsml_recovery.py`) confirms
+that on the 0904 set the `count_reasoning_tokens` stub still delegates to the
+engine's `reasoning_token_count` — i.e. the upstream refactor survives the
+patch. `patch_vllm.py verify <prefix>` still supports dry-run verification
+against a scratch copy of the `vllm/` tree instead of real site-packages.
 
 Also replayed all 96 captured real failure samples end-to-end through the
-patched parser: 31/31 orphan-invoke samples recovered as real tool calls,
-39/42 orphan-parameter and 17/17 dropped-stray-closer samples correctly
+patched parser (0823 set): 31/31 orphan-invoke samples recovered as real tool
+calls, 39/42 orphan-parameter and 17/17 dropped-stray-closer samples correctly
 triggered the bash regenerate fallback. The remaining 3 orphan-parameter
 samples were truncated mid-generation with no closing terminal at all (no
 detectable signal — not a mod defect).
-
-`patch_vllm.py verify <prefix>` supports dry-run verification against a
-scratch copy of the `vllm/` tree instead of the real site-packages.

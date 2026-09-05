@@ -5,10 +5,16 @@ set -euo pipefail
 # recovery (fullwidth + ASCII, missing/corrupted outer wrapper) plus
 # orphan-closing-tail absorption with synthetic bash regenerate.
 #
+# Version-aware: patch_vllm.py detects the installed parser-engine
+# generation and applies the matching replacement set:
+#   - files-0823/ for images without the 0904 token_count refactor
+#   - files-0904/ for images with it (keeps the upstream token_count/
+#     reasoning_token_count hooks, adds the same recovery branches)
+#
 # Supersedes mods/fix-deepseek-v4-orphan-invoke, -invoke-full, and -tail:
 # do not run this alongside any of them. Uses whole-file replacement
-# (files/*.py copied verbatim) instead of anchor-based string patching, so
-# it is not fragile to upstream formatting drift.
+# (versioned files-*/ *.py copied verbatim) instead of anchor-based string
+# patching, so it is not fragile to upstream formatting drift.
 # NB: purely local file patch — no network, no proxy required.
 
 PYTHON_ROOT="${VLLM_SITE_PACKAGES:-${PYTHON_ROOT:-/usr/local/lib/python3.12/dist-packages}}"
