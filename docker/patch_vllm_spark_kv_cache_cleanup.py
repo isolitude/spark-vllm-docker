@@ -16,6 +16,18 @@ text = target.read_text()
 lines = text.splitlines(keepends=True)
 changed = False
 
+# Fork (e.g. local-inference-lab/vllm dev/jovian-judgement) refactored this
+# function to track late persistent memory via a dedicated final profile
+# snapshot (final_profile_snapshot) and exclude it from KV sizing with
+# late_persistent_memory. That replaces this patch's purpose, and the old
+# anchor line this patch matches no longer exists there, so skip cleanly.
+if "final_profile_snapshot = MemorySnapshot(device=self.device)" in text:
+    print(
+        "Fork-style final_profile_snapshot profiling detected in gpu_worker.py: "
+        "late_persistent_memory already handles post-profile cleanup; skipping"
+    )
+    raise SystemExit(0)
+
 profile_cleanup_present = (
     "profile_result.after_profile.measure()" in text
     and "diff_from_create.non_torch_memory" in text

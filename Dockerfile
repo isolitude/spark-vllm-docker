@@ -415,8 +415,15 @@ ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
 ARG VLLM_PATCH_B12X_C128A_ALIGNMENT=0
 
-# PR refs include the branch history they were developed on. Use upstream main
-# only to identify each PR's patch range, then apply that patch to VLLM_REF.
+# PR refs include the branch history they were developed on. PRs against this
+# checkout's source are fetched from VLLM_REPO itself (which is a fork such as
+# local-inference-lab/vllm when a custom repo is selected, so PRs opened against
+# that fork resolve there rather than 404ing on upstream). The patch range is
+# computed against VLLM_REF instead of upstream main: PRs opened against a fork
+# branch share ancestry with that branch but not with main, so a main-based
+# merge-base is empty and fails (e.g. PR #634 lands on dev/jovian-judgement).
+# VLLM_REF remains correct for main-based PRs too, keeping the historical
+# behavior for the upstream/regular profile.
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
     VLLM_SELECTED_PRESET_PRS=""; \
@@ -448,23 +455,23 @@ RUN set -eux; \
         git config --global user.name "Docker Builder"; \
         \
         echo "Applying PR patches to vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD): $VLLM_ALL_PRS"; \
-        echo "Fetching upstream main only to calculate PR patch ranges; current checkout remains $VLLM_REF."; \
+        echo "Fetching PR refs from $VLLM_REPO; patch ranges are computed against ref $VLLM_REF. Current checkout remains $VLLM_REF."; \
         git remote remove vllm-upstream >/dev/null 2>&1 || true; \
-        git remote add vllm-upstream "$VLLM_UPSTREAM_REPO"; \
-        git fetch vllm-upstream +refs/heads/main:refs/remotes/vllm-upstream/main; \
+        git remote add vllm-upstream "$VLLM_REPO"; \
+        git fetch vllm-upstream +refs/heads/$VLLM_REF:refs/remotes/vllm-upstream/$VLLM_REF; \
         for pr in $VLLM_ALL_PRS; do \
             echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
             git fetch vllm-upstream +pull/${pr}/head:pr-${pr}; \
-            pr_base="$(git merge-base vllm-upstream/main pr-${pr} || true)"; \
+            pr_base="$(git merge-base vllm-upstream/$VLLM_REF pr-${pr} || true)"; \
             if [ -z "$pr_base" ]; then \
-                echo "Unable to find an upstream main merge-base for PR #$pr."; \
+                echo "Unable to find a merge-base for PR #$pr against ref $VLLM_REF."; \
                 exit 1; \
             fi; \
             patch_file="/tmp/pr-${pr}.patch"; \
             echo "PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
             git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
             if [ ! -s "$patch_file" ]; then \
-                echo "PR #$pr has no patch relative to upstream main; skipping."; \
+                echo "PR #$pr has no patch relative to $VLLM_REF; skipping."; \
                 rm -f "$patch_file"; \
                 continue; \
             fi; \
