@@ -7,9 +7,10 @@
 #             + #306 (mhc/_impl.py, rms_eps allowance). b12x is a pure
 #             Python/JIT package: overlaying the .py files is sufficient,
 #             no wheel rebuild needed.
-#   - LMCache : build+install PR #44 (engine-driven hybrid KV) from the
-#             vendored source tree (lmcache-44-src/), no network needed at
-#             runtime.
+#   - LMCache : build+install dev+5 source (engine-driven hybrid KV) from the
+#             vendored tree (lmcache-dev5-src.tar.gz): LMCache `dev`
+#             @7ed46754 + follow-up PRs #49/#50/#51/#55/#56, which replaced
+#             PR #44 in vLLM PR #634. No network needed at runtime.
 #   - flashinfer : nothing — the baked 0.6.18 already contains 803c logic.
 #
 # Idempotent: safe to re-run.
@@ -17,8 +18,9 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 B12X_OVERLAY="$ROOT_DIR/b12x-overlay/b12x"
-LMCACHE_TARGZ="$ROOT_DIR/lmcache-44-src.tar.gz"
-LMCACHE_PIN="273ed7f7fafa6ce0155a17deec7fa11a9894df7b"  # refs/pull/44/head
+LMCACHE_TARGZ="$ROOT_DIR/lmcache-dev5-src.tar.gz"
+LMCACHE_HEAD="14f4b01306af6c81705128c1ee87c1ee78ca9f81"  # dev @7ed46754 + PRs #49/#50/#51/#55/#56 (see PR_SOURCE in tarball)
+LMCACHE_DEV="7ed4675404a31f4ffafd98975899dc83832ba965"  # dev branch base
 LOG_PREFIX="[jj-ds4-vision-deps]"
 
 log() { echo "$LOG_PREFIX $*"; }
@@ -71,21 +73,30 @@ print("[jj-ds4-vision-deps] b12x overlay imports clean")
 PY
 
 # ---------------------------------------------------------------------------
-# 2) LMCache — build & install vendored PR #44 (engine-driven hybrid KV)
+# 2) LMCache — build & install vendored dev+5 source (engine-driven hybrid KV)
+#    dev @7ed46754 + follow-up PRs #49/#50/#51/#55/#56 (replaces PR #44,
+#    which vLLM PR #634 dropped in favor of these modern dev-lineage PRs)
 # ---------------------------------------------------------------------------
 if python3 -c 'import lmcache' 2>/dev/null; then
     v="$(python3 -c 'import lmcache; print(getattr(lmcache,"__version__","?"))' 2>/dev/null || echo '?')"
-    # detect whether existing install already is PR #44 (marker module)
-    if python3 -c 'import lmcache.v1.multiprocess.transfer_context.async_engine_driven as m; ok=hasattr(m,"EngineDrivenContextPickle") or True' 2>/dev/null \
-       && [ -f "$(python3 -c 'import lmcache,pathlib;print(pathlib.Path(lmcache.__file__).parent/"v1"/"multiprocess"/"transfer_context"/"async_engine_driven.py")' 2>/dev/null)" ]; then
-        log "LMCache already installed (version=$v) with PR #44 marker — skipping build."
+    # detect whether existing install already carries the dev+5 markers
+    # (PagedKVTransferWorkspace is #50; engine_driven_shm_pool is #56)
+    if python3 - <<'PY' 2>/dev/null
+import lmcache, pathlib
+p = pathlib.Path(lmcache.__file__).parent
+assert (p/"v1"/"multiprocess"/"transfer_context"/"base.py").exists()
+from lmcache.v1.multiprocess.transfer_context.base import PagedKVTransferWorkspace
+from lmcache.v1.multiprocess.modules.engine_driven_transfer import EngineDrivenTransferModule
+PY
+    then
+        log "LMCache already installed (version=$v) with dev+5 markers — skipping build."
         exit_or_skip=0
     else
-        log "LMCache present but missing PR #44 marker — will rebuild from vendored source."
+        log "LMCache present but missing dev+5 markers — will rebuild from vendored source."
         exit_or_skip=1
     fi
 else
-    log "LMCache not installed — building from vendored PR #44 source."
+    log "LMCache not installed — building from vendored dev+5 source."
     exit_or_skip=1
 fi
 
@@ -105,21 +116,22 @@ if [ "${exit_or_skip:-0}" = "1" ]; then
     mkdir -p "$LMCACHE_BUILD_DIR"
     tar xzf "$LMCACHE_TARGZ" -C "$LMCACHE_BUILD_DIR"
 
-    # Ensure the pinned commit matches the tarball (traceability guard).
-    if [ -f "$LMCACHE_BUILD_DIR/PR44_COMMIT" ] && [ "$(cat "$LMCACHE_BUILD_DIR/PR44_COMMIT")" != "$LMCACHE_PIN" ]; then
-        log "Warning: vendored LMCache pin $(cat "$LMCACHE_BUILD_DIR/PR44_COMMIT") != expected $LMCACHE_PIN; continuing with vendored content."
+    # Ensure the source HEAD matches the tarball (traceability guard).
+    # PR_SOURCE records dev base + the 5 follow-up PR heads.
+    if [ -f "$LMCACHE_BUILD_DIR/PR_SOURCE" ] && ! grep -q "$LMCACHE_HEAD" "$LMCACHE_BUILD_DIR/PR_SOURCE"; then
+        log "Warning: vendored LMCache HEAD $(grep -oE '[0-9a-f]{40}' "$LMCACHE_BUILD_DIR/PR_SOURCE" | tail -1) != expected $LMCACHE_HEAD; continuing with vendored content."
     fi
 
     # setuptools_scm reads version from git; vendored tree is not a git repo,
-    # so pretend a version matching PR #44's lineage.
-    export SETUPTOOLS_SCM_PRETEND_VERSION="0.5.2.post0+jj44.$LMCACHE_PIN"
+    # so pretend a version matching the dev lineage.
+    export SETUPTOOLS_SCM_PRETEND_VERSION="0.5.2.post0+jjdev5.$LMCACHE_DEV"
 
-    log "  building with --no-build-isolation (uses image torch 2.13 / toolchain; avoids pyproject's torch==2.11 pin)"
+    log "  building with --no-build-isolation (uses image torch 2.13 / toolchain; pyproject's pinned torch==2.13.0 would re-resolve under build isolation)"
     # Build the wheel once, install it. --no-deps: every runtime dep the image
     # needs is already present (torch, cuda-python, ...). redis/cufile are
     # optional storage backends, intentionally not pulled.
     uv pip install --python /usr/bin/python3 --no-build-isolation --no-deps "$LMCACHE_BUILD_DIR" \
-        || die "LMCache #44 build/install failed"
+        || die "LMCache dev+5 build/install failed"
     rm -rf "$LMCACHE_BUILD_DIR"
 
     # Install the light-weight runtime dependencies LMCache imports at startup
@@ -132,16 +144,33 @@ if [ "${exit_or_skip:-0}" = "1" ]; then
         || die "could not install LMCache light runtime deps"
 fi
 
-# Verify installed LMCache is PR #44 and importable.
+# Verify installed LMCache is the dev+5 source and importable.
 python3 - <<'PY' || die "LMCache post-install verification failed"
 import lmcache, pathlib
 print("[jj-ds4-vision-deps] LMCache installed:", getattr(lmcache, "__version__", "?"))
-tok = pathlib.Path(lmcache.__file__).parent / "v1" / "multiprocess" / "transfer_context" / "async_engine_driven.py"
-if not tok.exists():
-    raise SystemExit(f"LMCache async_engine_driven module missing: {tok} (not PR #44?)")
-import lmcache.v1.multiprocess.transfer_context.pickle as p
-assert hasattr(p, "EngineDrivenContextPickle"), "PR #44 EngineDrivenContextPickle missing"
-print("[jj-ds4-vision-deps] LMCache PR #44 markers present")
+p = pathlib.Path(lmcache.__file__).parent
+for rel in (
+    "v1/multiprocess/transfer_context/async_engine_driven.py",
+    "v1/multiprocess/transfer_context/base.py",
+    "v1/multiprocess/modules/engine_driven_transfer.py",
+):
+    if not (p / rel).exists():
+        raise SystemExit(f"LMCache module missing: {rel} (not dev+5 source?)")
+from lmcache.v1.multiprocess.transfer_context.base import (
+    PagedKVTransferWorkspace,          # PR #50
+)
+
+# Verify the follow-up markers are present (#55 lands in the H2D scatter path).
+import inspect as _inspect
+from lmcache.v1.multiprocess.transfer_context.base import scatter_cpu_to_paged_kv
+from lmcache.v1.multiprocess.modules.engine_driven_transfer import (
+    EngineDrivenTransferModule,
+)
+if "dynamically_pinned" not in _inspect.getsource(scatter_cpu_to_paged_kv):
+    raise SystemExit("PR #55 async-copy lifetime marker missing")
+if "engine_driven_shm_pool" not in _inspect.getsource(EngineDrivenTransferModule):
+    raise SystemExit("PR #56 SHM transport report marker missing")
+print("[jj-ds4-vision-deps] LMCache dev+5 markers present (#50/#55/#56)")
 PY
 
 # ---------------------------------------------------------------------------

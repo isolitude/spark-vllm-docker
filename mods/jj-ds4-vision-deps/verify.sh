@@ -4,7 +4,7 @@
 # Checks, against the *installed* environment, that the mod's three claims hold:
 #   1. b12x overlay applied (MHC_SUPPORTED_RMS_EPS contains 1e-20)
 #   2. b12x overlay modules import clean
-#   3. LMCache is PR #44 (async_engine_driven + EngineDrivenContextPickle)
+#   3. LMCache is the dev+5 source (engine-driven path + follow-up markers)
 #
 # Usage:
 #   apt/container:  bash /path/to/mods/jj-ds4-vision-deps/verify.sh
@@ -38,20 +38,27 @@ else
     bad "overlay module import failed"
 fi
 
-echo "== verify 3: LMCache is PR #44 =="
+echo "== verify 3: LMCache is dev+5 source (replaces PR #44) =="
 if python3 - <<'PY' 2>&1
-import lmcache, pathlib
+import lmcache, pathlib, inspect
 p = pathlib.Path(lmcache.__file__).parent
-tok = p / "v1" / "multiprocess" / "transfer_context" / "async_engine_driven.py"
-assert tok.exists(), f"async_engine_driven missing: {tok}"
-from lmcache.v1.multiprocess.transfer_context.pickle import EngineDrivenContextPickle
-from lmcache.v1.multiprocess.transfer_context.async_engine_driven import AsyncEngineDrivenTransferContext
+for rel in (
+    "v1/multiprocess/transfer_context/async_engine_driven.py",
+    "v1/multiprocess/transfer_context/base.py",
+    "v1/multiprocess/modules/engine_driven_transfer.py",
+):
+    assert (p / rel).exists(), f"module missing: {rel}"
+from lmcache.v1.multiprocess.transfer_context.base import PagedKVTransferWorkspace  # PR #50
+from lmcache.v1.multiprocess.transfer_context.base import scatter_cpu_to_paged_kv
+from lmcache.v1.multiprocess.modules.engine_driven_transfer import EngineDrivenTransferModule
+assert "dynamically_pinned" in inspect.getsource(scatter_cpu_to_paged_kv), "PR #55 marker missing"
+assert "engine_driven_shm_pool" in inspect.getsource(EngineDrivenTransferModule), "PR #56 marker missing"
 print("lmcache", getattr(lmcache, "__version__", "?"), "@", lmcache.__file__)
 PY
 then
-    ok "LMCache PR #44 markers present (async_engine_driven + EngineDrivenContextPickle)"
+    ok "LMCache dev+5 source present (PagedKVTransferWorkspace + #55/#56 markers)"
 else
-    bad "LMCache PR #44 markers missing — not PR #44?"
+    bad "LMCache dev+5 markers missing — not the dev+5 source?"
 fi
 
 echo
