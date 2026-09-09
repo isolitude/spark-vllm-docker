@@ -15,6 +15,7 @@ ARG B12X_CACHEBUST=""
 # Proxy settings (pass via --build-arg if needed)
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
+
 # Empty fallback for ordinary remote-source builds. A caller may override this
 # stage with --build-context vllm_source=/path/to/checkout.
 FROM scratch AS vllm_source
@@ -29,7 +30,7 @@ ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
 ARG CUTLASS_DSL_VERSION
 
-# Build parallelism
+# Build parallemism
 ARG BUILD_JOBS
 ENV MAX_JOBS=${BUILD_JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
@@ -406,24 +407,21 @@ RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
 
 WORKDIR $VLLM_BASE_DIR/vllm
 
-# Optional upstream PR patches requested by the build wrapper. PR #47392 is
-# carried as a source-aware runtime patch below because its full diff now
-# conflicts with current upstream main.
-ARG VLLM_PRESET_PRS=""
+# Optional upstream PR patches requested by the build wrapper. PR #54788 makes
+# Model Runner V2 honor an MTP/EAGLE draft's explicit MoE backend instead of
+# inheriting the quantized target's incompatible backend. Remove it once the fix
+# is present in the oldest vLLM ref used by regular builds. PR #47392 is carried
+# as a source-aware runtime patch below because its full diff now conflicts with
+# current upstream main.
+ARG VLLM_PRESET_PRS="54788"
 ARG VLLM_APPLY_PRESET_PRS=""
 ARG VLLM_PRS=""
 ARG VLLM_PRESERVE_SM12X_TARGET=0
 ARG VLLM_PATCH_B12X_C128A_ALIGNMENT=0
 
-# PR refs include the branch history they were developed on. PRs against this
-# checkout's source are fetched from VLLM_REPO itself (which is a fork such as
-# local-inference-lab/vllm when a custom repo is selected, so PRs opened against
-# that fork resolve there rather than 404ing on upstream). The patch range is
-# computed against VLLM_REF instead of upstream main: PRs opened against a fork
-# branch share ancestry with that branch but not with main, so a main-based
-# merge-base is empty and fails (e.g. PR #634 lands on dev/jovian-judgement).
-# VLLM_REF remains correct for main-based PRs too, keeping the historical
-# behavior for the upstream/regular profile.
+# Numeric PR refs are resolved from vllm-project/vllm. Full GitHub PR URLs are
+# downloaded from the named repository, preserving that PR's own base range.
+# In both cases, apply only the resulting patch to VLLM_REF.
 RUN set -eux; \
     VLLM_ALL_PRS=""; \
     VLLM_SELECTED_PRESET_PRS=""; \
@@ -455,36 +453,56 @@ RUN set -eux; \
         git config --global user.name "Docker Builder"; \
         \
         echo "Applying PR patches to vLLM ref $VLLM_REF ($VLLM_REQUESTED_HEAD): $VLLM_ALL_PRS"; \
-        echo "Fetching PR refs from $VLLM_REPO; patch ranges are computed against ref $VLLM_REF. Current checkout remains $VLLM_REF."; \
-        git remote remove vllm-upstream >/dev/null 2>&1 || true; \
-        git remote add vllm-upstream "$VLLM_REPO"; \
-        git fetch vllm-upstream +refs/heads/$VLLM_REF:refs/remotes/vllm-upstream/$VLLM_REF; \
+        VLLM_HAS_NUMERIC_PRS=""; \
         for pr in $VLLM_ALL_PRS; do \
-            echo "Fetching PR #$pr and applying its patch onto current HEAD..."; \
-            git fetch vllm-upstream +pull/${pr}/head:pr-${pr}; \
-            pr_base="$(git merge-base vllm-upstream/$VLLM_REF pr-${pr} || true)"; \
-            if [ -z "$pr_base" ]; then \
-                echo "Unable to find a merge-base for PR #$pr against ref $VLLM_REF."; \
+            if printf '%s\n' "$pr" | grep -Eq '^[1-9][0-9]*$'; then \
+                VLLM_HAS_NUMERIC_PRS=1; \
+            fi; \
+        done; \
+        if [ -n "$VLLM_HAS_NUMERIC_PRS" ]; then \
+            echo "Fetching upstream main to calculate numeric PR patch ranges; current checkout remains $VLLM_REF."; \
+            git remote remove vllm-upstream >/dev/null 2>&1 || true; \
+            git remote add vllm-upstream "$VLLM_UPSTREAM_REPO"; \
+            git fetch vllm-upstream +refs/heads/main:refs/remotes/vllm-upstream/main; \
+        fi; \
+        pr_index=0; \
+        for pr in $VLLM_ALL_PRS; do \
+            pr_index=$((pr_index + 1)); \
+            patch_file="/tmp/vllm-pr-${pr_index}.patch"; \
+            if printf '%s\n' "$pr" | grep -Eq '^[1-9][0-9]*$'; then \
+                pr_head="vllm-pr-${pr_index}"; \
+                echo "Fetching upstream vLLM PR #$pr and applying its patch onto current HEAD..."; \
+                git fetch vllm-upstream "+pull/${pr}/head:${pr_head}"; \
+                pr_base="$(git merge-base vllm-upstream/main "$pr_head" || true)"; \
+                if [ -z "$pr_base" ]; then \
+                    echo "Unable to find an upstream main merge-base for PR #$pr."; \
+                    exit 1; \
+                fi; \
+                echo "PR #$pr patch range: $pr_base..$pr_head; apply target: $(git rev-parse HEAD)."; \
+                git diff --binary "$pr_base" "$pr_head" > "$patch_file"; \
+            elif printf '%s\n' "$pr" | grep -Eq '^https://github\.com/[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*/pull/[1-9][0-9]*/?$'; then \
+                pr_url="${pr%/}"; \
+                echo "Fetching vLLM PR from ${pr_url}.diff and applying its patch onto current HEAD..."; \
+                curl -fsSL --retry 3 --retry-delay 1 "${pr_url}.diff" -o "$patch_file"; \
+            else \
+                echo "Invalid vLLM PR reference: $pr" >&2; \
                 exit 1; \
             fi; \
-            patch_file="/tmp/pr-${pr}.patch"; \
-            echo "PR #$pr patch range: $pr_base..pr-${pr}; apply target: $(git rev-parse HEAD)."; \
-            git diff --binary "$pr_base" "pr-${pr}" > "$patch_file"; \
             if [ ! -s "$patch_file" ]; then \
-                echo "PR #$pr has no patch relative to $VLLM_REF; skipping."; \
+                echo "vLLM PR $pr has no patch; skipping."; \
                 rm -f "$patch_file"; \
                 continue; \
             fi; \
             if git apply --reverse --check --binary "$patch_file" >/dev/null 2>&1; then \
-                echo "PR #$pr patch is already applied to HEAD; skipping."; \
+                echo "vLLM PR $pr patch is already applied to HEAD; skipping."; \
                 rm -f "$patch_file"; \
                 continue; \
             fi; \
             if git apply --3way --index --binary "$patch_file"; then \
                 if git diff --cached --quiet; then \
-                    echo "PR #$pr patch produced no staged changes; skipping."; \
+                    echo "vLLM PR $pr patch produced no staged changes; skipping."; \
                 else \
-                    git commit -m "Apply vLLM PR #${pr}"; \
+                    git commit -m "Apply vLLM PR ${pr}"; \
                 fi; \
                 rm -f "$patch_file"; \
             else \
@@ -497,27 +515,27 @@ RUN set -eux; \
                     esac; \
                 done; \
                 if [ -z "$conflict_files" ]; then \
-                    echo "PR #$pr patch failed without unmerged files."; \
+                    echo "vLLM PR $pr patch failed without unmerged files."; \
                     rm -f "$patch_file"; \
                     git reset --hard HEAD; \
                     exit 1; \
                 fi; \
                 if [ -n "$code_conflicts" ]; then \
-                    echo "PR #$pr has code patch conflicts: $code_conflicts"; \
+                    echo "vLLM PR $pr has code patch conflicts: $code_conflicts"; \
                     rm -f "$patch_file"; \
                     git reset --hard HEAD; \
                     exit 1; \
                 fi; \
-                echo "Skipping tests/docs conflicts for PR #$pr: $conflict_files"; \
+                echo "Skipping tests/docs conflicts for vLLM PR $pr: $conflict_files"; \
                 for conflict_file in $conflict_files; do \
                     git checkout --ours -- "$conflict_file"; \
                     git add "$conflict_file"; \
                 done; \
                 if git diff --cached --quiet; then \
-                    echo "PR #$pr only changed conflicting tests/docs files; skipping."; \
+                    echo "vLLM PR $pr only changed conflicting tests/docs files; skipping."; \
                     git reset --hard HEAD; \
                 else \
-                    git commit -m "Apply vLLM PR #${pr}"; \
+                    git commit -m "Apply vLLM PR ${pr}"; \
                 fi; \
                 rm -f "$patch_file"; \
             fi; \
